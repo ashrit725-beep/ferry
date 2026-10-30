@@ -1,0 +1,46 @@
+# Ferry gateway, admin API and console.
+# Install: cp ferry.service /etc/systemd/system/ && systemctl daemon-reload && systemctl enable --now ferry
+# Assumes: Ferry installed in /opt/ferry (deploy/offline-install.sh), data directory /var/lib/ferry
+# owned by the ferry user (useradd --system --home /var/lib/ferry ferry; ferry --data-dir /var/lib/ferry init).
+# Not yet exercised on a real host: validate with `systemd-analyze verify ferry.service` and `systemctl status`.
+
+[Unit]
+Description=Ferry gateway, admin API and console
+Documentation=file:///opt/ferry/share/doc/ferry/deployment.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ferry
+Group=ferry
+Environment=FERRY_DATA_DIR=/var/lib/ferry
+ExecStart=/opt/ferry/bin/ferry serve
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+
+# Hardening. The service needs only its data directory and loopback/private network access.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/ferry
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

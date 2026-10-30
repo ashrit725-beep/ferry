@@ -1,0 +1,48 @@
+# llama-server for one imported Ferry model, started through `ferry runtime llamacpp`,
+# which registers the backend and the pinned route, then execs llama-server with
+# --offline --no-webui on 127.0.0.1 with an API key file under the data directory.
+#
+# Instance name = the model name as imported, e.g.:
+#   systemctl enable --now ferry-llamacpp@qwen2.5-0.5b-instruct
+# A second model needs another port: add a drop-in that overrides ExecStart
+# (systemctl edit ferry-llamacpp@other-model) with a different --port.
+# llama-server must be on PATH for the ferry user, or add --binary /path/to/llama-server.
+# Not yet exercised on a real host.
+
+[Unit]
+Description=Ferry llama-server runtime for model %i (offline, loopback only)
+After=network-online.target
+Before=ferry.service
+
+[Service]
+Type=simple
+User=ferry
+Group=ferry
+Environment=FERRY_DATA_DIR=/var/lib/ferry
+ExecStart=/opt/ferry/bin/ferry runtime llamacpp %i --port 8081
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+# The runtime must never need the network: deny every address except loopback at the cgroup level,
+# in addition to llama-server's own --offline flag.
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/ferry
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+# GPU hosts: PrivateDevices is deliberately not set; add DeviceAllow= lines for /dev/nvidia* as needed.
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,30 @@
+# Bundle spec for the demo model. `ferry pack` reads this on the connected side.
+# Source paths are relative to this file. The model is fetched by
+# demo/fetch-model.sh from a pinned Hugging Face revision.
+
+[bundle]
+name = "qwen2.5-0.5b-instruct"
+version = "1.0.0"
+description = "Qwen2.5-0.5B-Instruct, Q4_K_M GGUF quantization, for llama.cpp"
+
+[requires]
+ferry_min_version = "0.1.0"
+runtime = "llama.cpp"
+min_memory_bytes = 1073741824
+
+[[artifacts]]
+source = "../.cache/upstream/qwen2.5-0.5b-instruct-gguf/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+path = "models/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+kind = "model"
+
+[artifacts.model]
+name = "qwen2.5-0.5b-instruct"
+license = "Apache-2.0"
+source_uri = "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF"
+source_revision = "9217f5db79a29953eb74d5343926648285ec7e67"
+upstream_sha256 = "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db"
+
+[[artifacts]]
+source = "../.cache/upstream/qwen2.5-0.5b-instruct-gguf/LICENSE"
+path = "docs/LICENSE"
+kind = "document"

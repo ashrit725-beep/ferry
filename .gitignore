@@ -1,0 +1,15 @@
+.venv/
+.cache/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+web/node_modules/
+demo/work/
+ferry-data/
+*.ferry.tar
+*.ferry.tar.sha256
+*.review.md
+.DS_Store
