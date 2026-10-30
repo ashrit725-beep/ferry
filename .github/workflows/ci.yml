@@ -12,7 +12,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # Pinned: the isolation checks depend on the OS release, and GitHub is
+        # migrating ubuntu-latest to Ubuntu 26.
+        os: [ubuntu-24.04, macos-latest]
         python: ["3.11", "3.12", "3.13"]
     runs-on: ${{ matrix.os }}
     steps:
@@ -41,7 +43,7 @@ jobs:
         run: python -m pytest -q tests/test_sandbox.py -k "actually_blocks_egress"
 
   console:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: web
