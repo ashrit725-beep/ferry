@@ -144,7 +144,7 @@ Run `ferry audit verify` and `ferry store verify` from a timer.
 | systemd units | Written, not run | `systemd-analyze verify`, start both units on a test host, confirm hardening does not block the runtime |
 | TLS | Supported by configuration, exercised only in tests | Deploy with real certificates |
 | Backups and restore | `ferry backup` / `ferry restore` with manifest verification; round trip covered by tests and by the demo on macOS | Rehearse on the production host with real volumes and a scheduled job |
-| CI | Workflow written, never run | Push to GitHub |
+| CI | Pushed to GitHub on 2026-10-29. While the repository was private, every run (including a one-line probe workflow) ended in `startup_failure`, an account-level Actions restriction rather than a workflow problem; the repository was made public the same day so runs can start | Read the first Ubuntu run: it is the first execution of the Linux isolation path |
 | Independent security assessment | None; internal AI-assisted review only | Third-party review before any classified or regulated use |
 | Supply chain of Ferry itself | Five direct dependencies, exact versions pinned in `deploy/requirements.lock` and recorded in evidence; wheelhouse carries `SHA256SUMS`; no signed release or reproducible build yet | Sign `SHA256SUMS` with a release key; require hashes at install |
 | Customers | None | The pilot in `docs/company/pilot.md` |
