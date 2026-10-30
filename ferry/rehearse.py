@@ -198,7 +198,7 @@ def rehearse(
         token_file.chmod(0o600)
         log_dir = tmpdir / "logs"
         log_dir.mkdir()
-        strace = isolation.mechanism == "unshare-netns" and shutil.which("strace") is not None
+        strace = isolation.linux_namespace and shutil.which("strace") is not None
         runner_args = {
             "binary": binary, "token_file": str(token_file), "log_dir": str(log_dir), "prompt": prompt,
             "max_tokens": max_tokens, "ctx_size": ctx_size, "load_timeout_s": load_timeout_s,
@@ -235,12 +235,16 @@ def rehearse(
                                        " the runtime's denials is not conclusive")
         elif strace:
             report["evidence_sources"].append("strace")
-        elif isolation.mechanism == "unshare-netns":
+        elif isolation.linux_namespace:
             report["notes"].append("strace is not installed, so the runtime's blocked connection attempts are"
                                    " inferred from its output only")
         report["evidence_sources"].append("output-scan")
 
-        for ran, expected in zip(out.get("models", []), models):
+        ran_models = out.get("models", [])
+        if len(ran_models) != len(models):
+            report["failures"].append(
+                f"the rehearsal runner returned results for {len(ran_models)} of {len(models)} model(s)")
+        for ran, expected in zip(ran_models, models):
             pids = set(ran.pop("pids", None) or [])
             if denials is not None:
                 ran["network_attempts"] = [d for d in denials if d["pid"] in pids]

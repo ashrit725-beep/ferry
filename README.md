@@ -32,6 +32,7 @@ The wedge decision and its revision are in [docs/strategy/](docs/strategy/).
 | Check a bundle without Ferry | OpenSSL 3 + `shasum` | Both signatures verified with stock OpenSSL 4.1 |
 | Rehearse: import into a throwaway store and serve the model with egress blocked | `ferry rehearse` | Real model: loads in under 1 s, completes, served file = imported file |
 | Receiving side: import, llama-server on the store file, gateway with API keys and policy, provenance check, audit chain, evidence, console | `ferry import/runtime/serve/...` | End-to-end demo with the real model; unauthorized app and unknown model denied before inference |
+| Back up and restore an installation (database snapshot, config, trust, secrets, optional store) with a verified manifest | `ferry backup`, `ferry restore` | Round-trip tests; tampered, incomplete or mislaid members refused; exercised in the demo |
 
 Test suite: 1,310 tests passing on 2026-10-29 (`pytest`), plus 5 opt-in tests
 against real llama.cpp and the real model (`FERRY_TEST_LLAMACPP_MODEL`,

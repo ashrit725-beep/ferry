@@ -73,7 +73,8 @@ Audit vocabulary (use these action names): `auth.login`, `auth.logout`,
 `backend.create`, `backend.update`, `backend.delete`, `backend.health`,
 `route.create`, `route.update`, `route.delete`, `trust.add`, `trust.revoke`,
 `admin.user_create`, `audit.verify`, `audit.export`, `audit.checkpoint`,
-`store.verify`, `system.start`. Outcomes are limited to `audit.OUTCOMES`.
+`store.verify`, `system.start`, `backup.create`, `backup.restore`. Outcomes are
+limited to `audit.OUTCOMES`.
 Actor types: `admin` (console user), `app` (API key principal), `cli` (local OS
 user, `getpass.getuser()`), `system`.
 
@@ -569,6 +570,14 @@ Jobs (`ferry/gateway/jobs.py`): in-memory registry, a small thread pool (2
 workers), progress via the verifier's `progress(bytes_done, bytes_total)`
 callback. Results are persisted through the importer (verifications table +
 audit), so a restart loses only in-flight job status.
+
+Amendments (2026-10-29): `GET /api/bundles`, `/api/apps` and `/api/models` take
+`limit` (default 1000, 1..5000). `POST /api/policy/validate` returns at most
+200 warnings plus one summarizing the rest. Audit readers return a row whose
+`details` are not valid JSON with `integrity: "details_unparseable"` and
+`details: {_unreadable: true, raw}`. The CLI gains `backup --out F
+[--include-store]` and `restore BACKUP --data-dir D [--force]`
+(`ferry/backup.py`).
 
 Static console: `ferry/static/index.html` served at `/`, assets at `/assets/*`.
 Hash-based client routing (`#/bundles`), so no server-side route fallback.

@@ -95,18 +95,28 @@ handing the system over.
 
 Everything lives in the data directory: `ferry.db` (registry, policies, keys
 as hashes, audit chain), `store/` (model files, content-addressed), `trust/`,
-`secrets/` (runtime tokens) and `ferry.toml`. To back up without stopping the
-service, snapshot the database with SQLite's online backup and copy the rest:
+`secrets/` (runtime tokens) and `ferry.toml`. `ferry backup` writes a plain
+tar with a manifest of every member's SHA-256; the database is snapshotted with
+SQLite's online backup, so the service keeps running:
 
 ```bash
-sudo -u ferry sqlite3 /var/lib/ferry/ferry.db ".backup /var/lib/ferry-backup/ferry.db" && sudo rsync -a --exclude ferry.db /var/lib/ferry/ /var/lib/ferry-backup/
+sudo -u ferry /opt/ferry/bin/ferry --data-dir /var/lib/ferry backup --out /var/backups/ferry/$(date +%F).tar
 ```
 
-Restore by stopping the services, replacing the data directory, and running
-`ferry store verify` and `ferry audit verify`. Export signed audit checkpoints
-regularly to a location the gateway host cannot write
-(`ferry audit checkpoint --sign-key <site key> --out ...`); they are what make
-truncation of the audit log detectable.
+Add `--include-store` to carry the model files too (large; they can also be
+rebuilt by re-importing the bundles). Restore into an empty directory, or
+replace one with `--force` (the old contents are moved aside, never deleted);
+every member is verified against the manifest before anything is put in
+place, and the restored audit chain is checked:
+
+```bash
+sudo -u ferry /opt/ferry/bin/ferry --data-dir /var/lib/ferry restore /var/backups/ferry/2026-10-29.tar --force
+```
+
+Then run `ferry store verify` (or re-import the bundles if the store was not
+included). Export signed audit checkpoints regularly to a location the gateway
+host cannot write (`ferry audit checkpoint --sign-key <site key> --out ...`);
+they are what make truncation of the audit log detectable.
 
 ## 7. Upgrades
 
@@ -129,14 +139,14 @@ Run `ferry audit verify` and `ferry store verify` from a timer.
 | Area | Status | What would change it |
 |---|---|---|
 | Core workflow (preflight, pack, verify, import, gateway, audit) | Working and tested on macOS; demo passes end to end with a real model | Run the same on a Linux host |
-| Linux network isolation | Written, never executed | A Linux host or the CI workflow in `.github/workflows/ci.yml`; hardened hosts may need `bwrap` or a root-created namespace instead of unprivileged `unshare` |
-| Offline install path | `deploy/offline-install.sh build` + `install` exercised on macOS into a fresh venv with `--no-index` | Build for `manylinux` and install on the real target OS |
+| Linux network isolation | Written, never executed. Candidates are self-tested in order (root `unshare --net`, unprivileged `unshare`, `bwrap`) and the preflight fails closed when none works or egress is not actually blocked | A Linux host or the CI workflow in `.github/workflows/ci.yml` |
+| Offline install path | `deploy/offline-install.sh build` + `install` exercised on macOS into a fresh venv with `--no-index`; dependency versions pinned by `deploy/requirements.lock` | Build for `manylinux` and install on the real target OS |
 | systemd units | Written, not run | `systemd-analyze verify`, start both units on a test host, confirm hardening does not block the runtime |
 | TLS | Supported by configuration, exercised only in tests | Deploy with real certificates |
-| Backups and restore | Documented, not rehearsed | Rehearse a restore on a test host |
+| Backups and restore | `ferry backup` / `ferry restore` with manifest verification; round trip covered by tests and by the demo on macOS | Rehearse on the production host with real volumes and a scheduled job |
 | CI | Workflow written, never run | Push to GitHub |
 | Independent security assessment | None; internal AI-assisted review only | Third-party review before any classified or regulated use |
-| Supply chain of Ferry itself | Five direct dependencies, versions recorded in evidence; no signed wheelhouse or reproducible build | Sign `SHA256SUMS` with a release key; pin dependency hashes |
+| Supply chain of Ferry itself | Five direct dependencies, exact versions pinned in `deploy/requirements.lock` and recorded in evidence; wheelhouse carries `SHA256SUMS`; no signed release or reproducible build yet | Sign `SHA256SUMS` with a release key; require hashes at install |
 | Customers | None | The pilot in `docs/company/pilot.md` |
 
 Ferry produces evidence that can support controls such as NIST SP 800-53

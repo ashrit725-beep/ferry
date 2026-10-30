@@ -63,11 +63,22 @@ model-name rewriting in streams; no prompt or completion text in the audit log.
 
 | Item | Why it is open |
 |---|---|
-| A header-less pickle stream hidden inside a safetensors header is not scanned (only the `\x80` protocol 2-5 polyglot check runs there) | Outside bundle-2's scope; needs its own review. Safetensors headers are validated as JSON, which such a stream would fail, but this has not been proven |
-| `audit.query_events`, `get_event` and `export_jsonl` raise on a row whose `details` is not valid JSON (`verify_chain` reports it correctly) | Observation, not a finding; affects the console's audit list after tampering |
-| `/api/policy/validate` warnings are uncapped (about 4x response amplification, reachable by auditors); `/api/bundles`, `/api/apps` and `/api/models` have no `limit` parameter | Noted by the web reviewer as not a defect in v1's single-admin setting |
-| Linux isolation (`unshare --net`) and strace evidence paths | Never executed on a Linux host |
+| Linux isolation (`unshare --net`, `bwrap`) and strace evidence paths | Never executed on a Linux host |
 | React console source | Not reviewed |
+
+Resolved on 2026-10-29, after the review (tests in `tests/test_hardening.py`):
+
+- The header-less pickle scan now also runs on files that parse as safetensors,
+  so a stream laid out to skip into the JSON header is classified as pickle;
+  well-formed files with header lengths whose bytes form pickle opcodes stay
+  safetensors.
+- `audit.query_events`, `get_event` and `export_jsonl` return a row whose
+  `details` were tampered into invalid JSON with an `integrity:
+  details_unparseable` marker instead of raising; `verify_chain` still reports
+  the row.
+- Policy validation returns at most 200 warnings plus a count of the rest;
+  `/api/bundles`, `/api/apps` and `/api/models` take `limit` (default 1000,
+  at most 5000).
 
 ## Final state
 

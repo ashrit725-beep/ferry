@@ -290,7 +290,7 @@ def import_bundle(settings: Settings, database: Database, source: str | Path, *,
                      canonical_json(manifest.to_dict()).decode("ascii"), canonical_json(signers).decode("ascii"),
                      canonical_json(report.to_dict()).decode("ascii"), now_text, actor, source.name),
                 )
-            for entry, record in zip(manifest.artifacts, report.artifacts):
+            for entry, record in zip(manifest.artifacts, report.artifacts, strict=True):
                 model = entry.model.to_dict() if entry.model else None
                 conn.execute(
                     "INSERT OR IGNORE INTO artifacts (digest, size, kind, format, model_name, metadata,"

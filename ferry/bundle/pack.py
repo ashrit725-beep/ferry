@@ -176,7 +176,8 @@ def _manifest_doc(spec: PackSpec, created_at: str, facts: list[dict[str, Any]]) 
     return build_manifest(
         name=spec.name, version=spec.version, created_at=created_at, description=spec.description,
         requires=spec.requires,
-        artifacts=[{"path": a.path, "kind": a.kind, "model": a.model, **f} for a, f in zip(spec.artifacts, facts)],
+        artifacts=[{"path": a.path, "kind": a.kind, "model": a.model, **f}
+                   for a, f in zip(spec.artifacts, facts, strict=True)],
     )
 
 
@@ -401,7 +402,7 @@ def pack_bundle(spec_path: str | Path, signing_key: Ed25519PrivateKey, out_dir: 
         raise CryptoError("the signing key produced a signature that does not verify")
 
     out.mkdir(parents=True, exist_ok=True)
-    members = [(art.path, art.source, f["size"], f["sha256"]) for art, f in zip(spec.artifacts, facts)]
+    members = [(art.path, art.source, f["size"], f["sha256"]) for art, f in zip(spec.artifacts, facts, strict=True)]
     tar_digest, tar_size = _write_tar(tar_path, manifest_raw, {kid: signature}, members, mtime, advance)
     try:
         atomic_write(sha_path, f"{tar_digest}  {tar_path.name}\n".encode("utf-8"), mode=0o644)

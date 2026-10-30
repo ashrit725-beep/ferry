@@ -167,7 +167,12 @@ step "15. Audit chain and evidence"
 "$FERRY" --data-dir "$DATA" evidence --format md --out "$WORK/evidence.md"
 echo "Evidence report: $WORK/evidence.md"
 
-step "16. Console user (password stored in a 0600 file, not printed)"
+step "16. Backup the installation and rehearse a restore"
+"$FERRY" --data-dir "$DATA" backup --out "$WORK/backup.tar"
+"$FERRY" --data-dir "$WORK/restored" restore "$WORK/backup.tar"
+"$FERRY" --data-dir "$WORK/restored" audit verify
+
+step "17. Console user (password stored in a 0600 file, not printed)"
 "$PY" -c 'import secrets; print(secrets.token_urlsafe(18))' > "$WORK/admin-password.txt"
 chmod 600 "$WORK/admin-password.txt"
 "$FERRY" --data-dir "$DATA" admin create-user admin --role admin --password-stdin < "$WORK/admin-password.txt"

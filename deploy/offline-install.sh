@@ -38,17 +38,21 @@ build() {
   echo "Building the Ferry wheel"
   "$python" -m pip wheel --no-deps --quiet . -w "$out"
 
-  local deps
+  local deps constraints=()
   deps="$("$python" -c 'import tomllib; print(" ".join(tomllib.load(open("pyproject.toml", "rb"))["project"]["dependencies"]))')"
+  if [ -f deploy/requirements.lock ]; then
+    constraints=(-c deploy/requirements.lock)
+    echo "Pinning dependency versions from deploy/requirements.lock"
+  fi
   echo "Downloading dependency wheels: $deps"
   if [ -n "$platform" ] || [ -n "$pyver" ]; then
     [ -n "$platform" ] && [ -n "$pyver" ] || { echo "--platform and --python must be given together" >&2; exit 2; }
     # shellcheck disable=SC2086
     "$python" -m pip download --quiet --only-binary=:all: --platform "$platform" --python-version "$pyver" \
-      --implementation cp -d "$out" $deps
+      --implementation cp "${constraints[@]}" -d "$out" $deps
   else
     # shellcheck disable=SC2086
-    "$python" -m pip download --quiet --only-binary=:all: -d "$out" $deps
+    "$python" -m pip download --quiet --only-binary=:all: "${constraints[@]}" -d "$out" $deps
   fi
 
   ( cd "$out" && rm -f SHA256SUMS && $(sha_tool) ./*.whl > SHA256SUMS )

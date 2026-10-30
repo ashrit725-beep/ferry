@@ -95,6 +95,22 @@ def _row_to_event(row: sqlite3.Row) -> dict[str, Any]:
     return event
 
 
+def _row_to_event_lenient(row: sqlite3.Row) -> dict[str, Any]:
+    """For readers and exports. A row whose details were tampered into invalid
+    JSON comes back with a marker instead of raising, so the console and the
+    export keep working and show the damage. verify_chain uses the strict reader."""
+    try:
+        return _row_to_event(row)
+    except (ValueError, TypeError, RecursionError):
+        event = {k: row[k] for k in HASHED_FIELDS if k != "details"}
+        raw = row["details"]
+        text = raw if isinstance(raw, str) else repr(raw)
+        event["details"] = {"_unreadable": True, "raw": text[:1024]}
+        event["hash"] = row["hash"]
+        event["integrity"] = "details_unparseable"
+        return event
+
+
 def append_event(
     conn: sqlite3.Connection,
     *,
@@ -301,12 +317,12 @@ def query_events(
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY seq DESC LIMIT ?"
     params.append(max(1, min(int(limit), 500)))
-    return [_row_to_event(r) for r in conn.execute(sql, params).fetchall()]
+    return [_row_to_event_lenient(r) for r in conn.execute(sql, params).fetchall()]
 
 
 def get_event(conn: sqlite3.Connection, seq: int) -> dict[str, Any] | None:
     row = conn.execute("SELECT * FROM audit_events WHERE seq = ?", (seq,)).fetchone()
-    return _row_to_event(row) if row else None
+    return _row_to_event_lenient(row) if row else None
 
 
 def facets(conn: sqlite3.Connection) -> dict[str, list[str]]:
@@ -325,6 +341,6 @@ def export_jsonl(conn: sqlite3.Connection, fh: IO[str]) -> int:
         if not rows:
             break
         for row in rows:
-            fh.write(canonical_json(_row_to_event(row)).decode("ascii") + "\n")
+            fh.write(canonical_json(_row_to_event_lenient(row)).decode("ascii") + "\n")
             count += 1
     return count

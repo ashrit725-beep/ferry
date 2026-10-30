@@ -421,9 +421,11 @@ _BUNDLE_SELECT = (
 
 
 @router.get("/bundles")
-def list_bundles(request: Request, user: SessionUser = Depends(any_role)) -> dict[str, Any]:
+def list_bundles(request: Request, limit: int = Query(1000, ge=1, le=5000),
+                 user: SessionUser = Depends(any_role)) -> dict[str, Any]:
     with _db(request) as conn:
-        rows = conn.execute(_BUNDLE_SELECT + " GROUP BY b.bundle_id ORDER BY b.imported_at DESC, b.bundle_id").fetchall()
+        rows = conn.execute(_BUNDLE_SELECT + " GROUP BY b.bundle_id ORDER BY b.imported_at DESC, b.bundle_id LIMIT ?",
+                            (limit,)).fetchall()
     return {"items": [_bundle_summary(r) for r in rows]}
 
 
@@ -469,7 +471,8 @@ def get_trust(request: Request, user: SessionUser = Depends(any_role)) -> dict[s
 
 
 @router.get("/models")
-def list_models(request: Request, user: SessionUser = Depends(any_role)) -> dict[str, Any]:
+def list_models(request: Request, limit: int = Query(1000, ge=1, le=5000),
+                user: SessionUser = Depends(any_role)) -> dict[str, Any]:
     settings = _state(request).settings
     with _db(request) as conn:
         routed: dict[str, list[str]] = {}
@@ -479,7 +482,7 @@ def list_models(request: Request, user: SessionUser = Depends(any_role)) -> dict
             "SELECT a.digest, a.model_name, a.size, a.format, a.metadata, a.first_bundle_id, a.imported_at,"
             " b.name AS bundle_name, b.version AS bundle_version FROM artifacts a"
             " LEFT JOIN bundles b ON b.bundle_id = a.first_bundle_id WHERE a.kind = 'model'"
-            " ORDER BY a.model_name, a.imported_at").fetchall()
+            " ORDER BY a.model_name, a.imported_at LIMIT ?", (limit,)).fetchall()
     items = []
     for r in rows:
         meta = _json(r["metadata"], {})
@@ -577,9 +580,10 @@ def delete_route(request: Request, route_id: RowId, user: SessionUser = Depends(
 
 
 @router.get("/apps")
-def list_applications(request: Request, user: SessionUser = Depends(any_role)) -> dict[str, Any]:
+def list_applications(request: Request, limit: int = Query(1000, ge=1, le=5000),
+                      user: SessionUser = Depends(any_role)) -> dict[str, Any]:
     with _db(request) as conn:
-        return {"items": auth.list_principals(conn)}
+        return {"items": auth.list_principals(conn)[:limit]}
 
 
 @router.post("/apps", status_code=201)

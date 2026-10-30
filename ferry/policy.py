@@ -28,6 +28,9 @@ MAX_LIST_ITEMS = 256
 MAX_DESCRIPTION_CHARS = 2000
 MAX_COMMENT_CHARS = 1000
 MAX_TOKENS_LIMIT = 1_000_000
+# Warnings are advisory; beyond this many the document is wrong in bulk and the
+# response would only amplify a large request.
+MAX_WARNINGS = 200
 
 RULE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 # The naming grammar shared with auth.py (principals) and backends.py (routes).
@@ -327,6 +330,10 @@ def _warnings(rules: list[CompiledRule], known_apps: Iterable[str] | None,
             else:
                 warn(rule.id, f"never decisive: the earlier deny rule '{shadow.id}' already matches "
                               "every request this rule matches")
+    if len(out) > MAX_WARNINGS:
+        dropped = len(out) - MAX_WARNINGS
+        out = out[:MAX_WARNINGS]
+        out.append({"rule_id": None, "message": f"{dropped} more warning(s) not shown"})
     return out
 
 

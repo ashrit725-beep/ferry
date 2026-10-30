@@ -461,7 +461,7 @@ class _Run:
         assert self.manifest is not None
         listed = {a.path for a in self.manifest.artifacts}
         missing = []
-        for a, record in zip(self.manifest.artifacts, self.artifacts):
+        for a, record in zip(self.manifest.artifacts, self.artifacts, strict=True):
             if a.path in self.files:
                 continue
             if a.path in self.duplicated:
@@ -482,7 +482,7 @@ class _Run:
         assert self.manifest is not None
         size_problems, digest_problems, format_problems = [], [], []
         to_read = []
-        for a, record in zip(self.manifest.artifacts, self.artifacts):
+        for a, record in zip(self.manifest.artifacts, self.artifacts, strict=True):
             member = self.files.get(a.path)
             if member is None:
                 continue
@@ -581,7 +581,7 @@ class _Run:
         licenses = {lic.casefold() for lic in pol.allowed_licenses}
         file_ok = "file" in pol.allowed_kinds
         found: dict[str, list[str]] = {cid: [] for cid in _POLICY}
-        for a, record in zip(self.manifest.artifacts, self.artifacts):
+        for a, record in zip(self.manifest.artifacts, self.artifacts, strict=True):
             detected = record["detected_format"]
             formats = {a.format} | ({detected} if detected else set())
             reasons = []

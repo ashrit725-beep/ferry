@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased (branch production-hardening)
+
+- `ferry backup` and `ferry restore`: plain-tar backups with a SHA-256
+  manifest of every member, database snapshotted online; restore verifies
+  everything before putting it in place and checks the restored audit chain.
+- Linux network isolation now tries candidates in order (root `unshare --net`,
+  unprivileged `unshare`, `bwrap --unshare-net`), self-tests each, and fails
+  closed with the reasons when none works. Still not executed on a Linux host.
+- Preflight and rehearsal no longer compare mechanism names; `--ready-url` and
+  `--request-url` must be http(s) URLs.
+- Audit readers and the export survive tampered `details` rows and mark them;
+  policy validation caps warnings at 200; `/api/bundles`, `/api/apps` and
+  `/api/models` take `limit`; the header-less pickle scan also covers files
+  that parse as safetensors.
+- Manifest/record pairings use `zip(strict=True)`; a rehearsal reports a runner
+  that returned results for the wrong number of models.
+- `deploy/requirements.lock` pins the dependency closure; the offline installer
+  uses it as a constraints file.
+- Console: `npm ci && npm run build` reproduces the committed `ferry/static`
+  byte for byte.
+
 ## 0.1.0 (2026-10-29)
 
 First working version. Verified on macOS (Apple Silicon) only; see

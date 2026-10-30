@@ -11,6 +11,7 @@ import dataclasses
 import json
 import os
 import sys
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -97,6 +98,16 @@ def _kv(values: list[str], what: str) -> dict[str, str]:
     return out
 
 
+def _is_http_url(value: str) -> bool:
+    """Only http(s) URLs with a host: the readiness and smoke requests go to a server the
+    command started, never to a file or another scheme urllib would happily open."""
+    try:
+        parts = urllib.parse.urlsplit(value)
+    except ValueError:
+        return False
+    return parts.scheme in ("http", "https") and bool(parts.hostname)
+
+
 def cmd_preflight(args: argparse.Namespace) -> int:
     from .preflight import preflight, render_markdown
 
@@ -114,6 +125,10 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     if (args.request_json or args.header) and not args.request_url:
         print("ferry preflight: --request-json and --header need --request-url", file=sys.stderr)
         return 2
+    for flag, value in (("--ready-url", args.ready_url), ("--request-url", args.request_url)):
+        if value and not _is_http_url(value):
+            print(f"ferry preflight: {flag} must be an http:// or https:// URL with a host", file=sys.stderr)
+            return 2
     request = None
     if args.request_url:
         body = json.loads(Path(args.request_json).read_text(encoding="utf-8")) if args.request_json else None

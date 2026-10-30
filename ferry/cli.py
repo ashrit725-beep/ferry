@@ -1032,6 +1032,49 @@ def _common() -> argparse.ArgumentParser:
     return common
 
 
+def cmd_backup(args: argparse.Namespace) -> int:
+    from .backup import create_backup
+
+    settings = _require_settings(args)
+    database = _database(settings)
+    summary = create_backup(settings, database, Path(args.out), include_store=args.include_store,
+                            actor_type="cli", actor_id=_actor())
+    if args.json:
+        _print_json(summary)
+    else:
+        store = "store included" if summary["include_store"] else "store not included (re-import bundles to rebuild it)"
+        print(f"Backup written  {summary['path']}")
+        print(f"Members         {summary['members']} ({summary['total_bytes']:,} bytes), {store}")
+        print("Keep backups where the gateway host cannot write them; rehearse a restore with:"
+              " ferry restore BACKUP --data-dir <empty dir>")
+    return EXIT_OK
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    from .backup import restore_backup
+
+    data_dir = getattr(args, "data_dir", None) or os.environ.get("FERRY_DATA_DIR")
+    if not data_dir:
+        raise UsageError("restore needs --data-dir (or FERRY_DATA_DIR): the directory to restore into")
+    path = Path(args.archive)
+    _require_exists(path)
+    result = restore_backup(path, Path(data_dir), force=args.force, actor_type="cli", actor_id=_actor())
+    if args.json:
+        _print_json(result)
+    else:
+        print(f"Restored        {result['members']} member(s) into {result['data_dir']}"
+              f" (backup from {result['backup_created_at']})")
+        if result["replaced"]:
+            print(f"Previous data   moved to {result['replaced']}; delete it yourself once the restore is confirmed")
+        chain = "intact" if result["audit_chain_ok"] else f"PROBLEM: {result['audit_problem']}"
+        print(f"Audit chain     {chain}")
+        if result["include_store"]:
+            print("Next            ferry store verify")
+        else:
+            print("Store           not in this backup: re-import the bundles, then run ferry store verify")
+    return EXIT_OK if result["audit_chain_ok"] else EXIT_REJECTED
+
+
 def build_parser() -> argparse.ArgumentParser:
     common = _common()
     parser = argparse.ArgumentParser(
@@ -1206,6 +1249,17 @@ def build_parser() -> argparse.ArgumentParser:
     p = command("evidence", cmd_evidence, "write the evidence report")
     p.add_argument("--format", choices=("md", "json"), default="md")
     p.add_argument("--out", metavar="F")
+
+    p = command("backup", cmd_backup, "write a backup of the data directory (database snapshot, config, trust, secrets)")
+    p.add_argument("--out", metavar="F", required=True, help="backup file to create (must not exist)")
+    p.add_argument("--include-store", action="store_true", help="also include the artifact store (can be very large)")
+    p.add_argument("--json", action="store_true")
+
+    p = command("restore", cmd_restore, "restore a backup into --data-dir (absent or empty unless --force)")
+    p.add_argument("archive", metavar="BACKUP")
+    p.add_argument("--force", action="store_true",
+                   help="replace a non-empty data directory (its contents are moved aside, not deleted)")
+    p.add_argument("--json", action="store_true")
 
     p = command("doctor", cmd_doctor, "check this host and list its network interactions")
     p.add_argument("--probe-network", action="store_true",

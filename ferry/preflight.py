@@ -410,7 +410,7 @@ def preflight(
         report["warnings"].append(message)
 
     strace_out = None
-    if isolation.mechanism == "unshare-netns":
+    if isolation.linux_namespace:
         if shutil.which("strace"):
             strace_out = str(work / "strace.txt")
         else:

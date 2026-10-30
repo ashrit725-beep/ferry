@@ -19,7 +19,7 @@ risks in [threat-model.md](threat-model.md).
 
 | Limitation | Why it matters | Fix |
 |---|---|---|
-| Linux isolation uses `unshare --net --map-root-user` (unprivileged user namespaces). Hardened hosts often disable them: RHEL STIG profiles set `user.max_user_namespaces = 0`, and Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor by default. Expect it to fail on such hosts | Most prospects' build hosts are Linux | Add backends: root `unshare --net`, `bwrap --unshare-net`, `docker run --network none`, systemd `PrivateNetwork=`; test on RHEL 9 and Ubuntu 24.04 |
+| Linux isolation has never been executed. Candidates are tried in order with a self-test (root `unshare --net`, unprivileged `unshare --net --map-root-user`, `bwrap --unshare-net`); hardened hosts often disable unprivileged user namespaces (RHEL STIG sets `user.max_user_namespaces = 0`, Ubuntu 24.04 restricts them through AppArmor), so on such hosts only the root or `bwrap` paths can work. When none works the preflight fails closed and names what was tried | Most prospects' build hosts are Linux | Run on RHEL 9 and Ubuntu 24.04 (the CI workflow does this on push); consider `docker run --network none` and systemd `PrivateNetwork=` as further candidates |
 | macOS isolation uses `sandbox-exec`, which Apple marks deprecated | It could disappear in a future macOS | Keep it for demos and Mac-based packers; Linux is the customer platform |
 | On macOS the kernel log redacts destination addresses; DNS lookups show up only as denied connections to the resolver socket, with no name | Non-Python processes are attributed to a process and port, not a host | Python processes are covered by the audit hook; for native code use Linux with `strace` |
 | The Python audit hook only loads in Python processes that honour `PYTHONPATH` (not `python -I`, not processes with their own `sitecustomize`), and native extensions (C, Rust, e.g. `hf-xet`) bypass Python audit events | Some calls get only OS-level evidence | Document; consider `LD_PRELOAD`/DYLD interposition later |
@@ -47,7 +47,7 @@ risks in [threat-model.md](threat-model.md).
 
 | Limitation | Why it matters | Fix |
 |---|---|---|
-| One host, one SQLite file, no high availability | A host failure stops serving | Documented backup of the data directory; HA later if demanded |
+| One host, one SQLite file, no high availability | A host failure stops serving until a restore | `ferry backup` / `ferry restore` exist (manifest-verified, online database snapshot); schedule them. HA later if demanded |
 | No SSO, LDAP or MFA for console users; the login throttle is in memory | Weaker identity than enterprise consoles | SSO/OIDC when a design partner requires it |
 | Provenance checks work only for llama.cpp (`/props` `model_path`); Ollama and generic OpenAI backends are always "unverified" | Routes to them must set `require_verified=false` | Adapter-specific provenance |
 | Provenance is taken from the last health check (default every 30 s) | A backend restarted on a different file is served until the next check | Re-check on connection errors; shorter interval |

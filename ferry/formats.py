@@ -105,8 +105,8 @@ _ARCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 # these nothing callable can reach the unpickler's stack.
 _PICKLE_IMPORT_OPS = frozenset({"GLOBAL", "STACK_GLOBAL", "INST", "EXT1", "EXT2", "EXT4", "PERSID", "BINPERSID"})
 
-_DISPLAY_UNSAFE = re.compile("[\x00-\x1f\x7f-\x9f​-‏ -‮⁦-⁩﻿]")
-_MULTILINE_UNSAFE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f​-‏ -‮⁦-⁩﻿]")
+_DISPLAY_UNSAFE = re.compile("[\x00-\x1f\x7f-\x9f\u200b-‏ -‮⁦-⁩﻿]")
+_MULTILINE_UNSAFE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u200b-‏ -‮⁦-⁩﻿]")
 
 
 def has_unsafe_text(value: str, multiline: bool = False) -> bool:
@@ -864,6 +864,11 @@ def detect_format(fileobj: IO[bytes], size: int, name: str = "") -> FormatInfo:
                     return FormatInfo("pickle", {"container": "raw", "polyglot": "safetensors"})
             if head[:2] == b"MZ" and _pe_header(fileobj, size):
                 return FormatInfo("executable", {"kind": "pe", "polyglot": "safetensors"})
+            # A header-less pickle stream could in principle be laid out so that an
+            # unpickler reading from byte 0 skips into the JSON header; scan for it
+            # the same way as for any other file.
+            if _headerless_pickle(fileobj, size):
+                return FormatInfo("pickle", {"container": "raw", "header": "none", "polyglot": "safetensors"})
             return _with_polyglot_checks(safetensors, probe)
 
     kind = _executable_magic(head)
