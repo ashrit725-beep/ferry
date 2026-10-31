@@ -16,15 +16,16 @@ import { NowProvider } from './now.tsx';
 import { parseHash, paths, replaceRoute, safeNext, type RouteMatch } from './router.ts';
 import { SessionContext, type Session } from './session.tsx';
 import { isAdminRole } from './status.ts';
-import { IconLogo } from './components/Icons.tsx';
 import { Shell } from './components/Shell.tsx';
-import { Spinner } from './components/States.tsx';
+import { Spinner } from '@/components/console/states.tsx';
+import { Button } from '@/components/ui/button.tsx';
 import { AccessPage } from './pages/AccessPage.tsx';
 import { AuditPage } from './pages/AuditPage.tsx';
 import { BundleDetailPage } from './pages/BundleDetailPage.tsx';
 import { BundlesPage } from './pages/BundlesPage.tsx';
 import { EvidencePage } from './pages/EvidencePage.tsx';
-import { LoginPage } from './pages/LoginPage.tsx';
+import { ConsoleCard, LoginPage } from './pages/LoginPage.tsx';
+import { Checklist, ChecklistLine } from '@/components/console/checklist.tsx';
 import { ModelsPage } from './pages/ModelsPage.tsx';
 import { NotFoundPage } from './pages/NotFoundPage.tsx';
 import { OverviewPage } from './pages/OverviewPage.tsx';
@@ -158,10 +159,11 @@ function Page({ route }: { route: RouteMatch }) {
   }
 }
 
+/** A quiet connecting state: the ground, the spinner and one line, announced politely. */
 function Boot() {
   return (
-    <div className="boot" role="status">
-      <span className="row">
+    <div role="status" className="flex min-h-svh items-center justify-center bg-ground px-4">
+      <span className="inline-flex items-center gap-2 text-sm text-text-2">
         <Spinner />
         Connecting to the Ferry server…
       </span>
@@ -171,24 +173,18 @@ function Boot() {
 
 function Unreachable({ error, onRetry }: { error: unknown; onRetry: () => void }) {
   return (
-    <div className="boot">
-      <main className="login__card" aria-labelledby="unreachable-title">
-        <p className="login__brand">
-          <IconLogo />
-          Ferry
-        </p>
-        <h1 id="unreachable-title" className="login__title">
-          The console cannot reach the server
-        </h1>
-        <p className="muted" role="alert">
-          {describeError(error)}
-        </p>
-        <div className="form-actions">
-          <button type="button" className="button button--primary" onClick={onRetry}>
-            Try again
-          </button>
-        </div>
-      </main>
-    </div>
+    <ConsoleCard titleId="unreachable-title" title="The console cannot reach the server" beam={false}>
+      <Checklist as="div" ariaLabel="Connection">
+        <ChecklistLine as="div" label="Server" state="failed" stamp="Unreachable" value={<span className="truncate" title={window.location.host}>{window.location.host}</span>} />
+      </Checklist>
+      <p role="alert" className="text-sm text-text-2 text-pretty">
+        {describeError(error)}
+      </p>
+      <div className="flex flex-wrap items-center gap-2">
+        <Button type="button" onClick={onRetry}>
+          Try again
+        </Button>
+      </div>
+    </ConsoleCard>
   );
 }

@@ -1,23 +1,29 @@
 /**
- * Apps (the identities applications call the gateway with) and their keys.
+ * Apps (the identities applications call the gateway with) and their keys,
+ * in one table: each app row is followed by its key rows. Revoked keys print
+ * in grey; secrets are shown once, in the issue dialog, never here.
  */
 
-import { Fragment, useState, type FormEvent } from 'react';
+import { useState, type FormEvent } from 'react';
+import { KeyRound, Plus } from 'lucide-react';
 import { api, ENVIRONMENTS, type ApiKeySummary, type App, type Environment } from '../../api.ts';
 import { appliedDespiteBody, describeError, formErrors, type FormErrors } from '../../errors.ts';
 import { APP_NAME, optionalText } from '../../forms.ts';
-import { formatInt } from '../../format.ts';
+import { formatInt, plural } from '../../format.ts';
 import { useResource } from '../../hooks.ts';
 import { useNow } from '../../now.tsx';
 import { useRole, useSession } from '../../session.tsx';
-import { keyStatus } from '../../status.ts';
-import { ConfirmDialog } from '../../components/Dialog.tsx';
-import { Field, FormErrorList } from '../../components/Field.tsx';
-import { IconPlus } from '../../components/Icons.tsx';
-import { Notice, Panel, type NoticeMessage } from '../../components/Panel.tsx';
-import { Async, EmptyState, InlineError } from '../../components/States.tsx';
-import { StatusBadge } from '../../components/StatusBadge.tsx';
-import { Time } from '../../components/Time.tsx';
+import { keyStatus, type KeyStatus } from '../../status.ts';
+import { Notice, type NoticeMessage } from '../../components/console/callout.tsx';
+import { ConfirmDialog } from '../../components/console/confirm-dialog.tsx';
+import { DataTable, type Column } from '../../components/console/data-table.tsx';
+import { MonoId } from '../../components/console/digest.tsx';
+import { FormActions, FormErrorList, FormGrid, SelectField, TextField } from '../../components/console/form-field.tsx';
+import { Section } from '../../components/console/section.tsx';
+import { EmptyState, InlineError, Spinner } from '../../components/console/states.tsx';
+import { StatusBadge } from '../../components/console/status-badge.tsx';
+import { Time } from '../../components/console/time.tsx';
+import { Button } from '../../components/ui/button.tsx';
 import { IssueKeyDialog } from './IssueKeyDialog.tsx';
 
 const APP_FIELDS = ['name', 'environment', 'description'] as const;
@@ -25,9 +31,31 @@ const NO_ERRORS: FormErrors = { fields: {}, general: [] };
 
 type Pending = { kind: 'revoke'; app: App; key: ApiKeySummary } | { kind: 'disable'; app: App };
 
+type Row =
+  | { kind: 'app'; app: App; active: number }
+  | { kind: 'key'; app: App; key: ApiKeySummary; status: KeyStatus }
+  | { kind: 'nokeys'; app: App };
+
+function rowsOf(apps: readonly App[], now: number): Row[] {
+  const rows: Row[] = [];
+  for (const app of apps) {
+    const statuses = app.keys.map((key) => ({ key, status: keyStatus(key, now) }));
+    rows.push({ kind: 'app', app, active: statuses.filter((s) => s.status === 'active').length });
+    if (statuses.length === 0) rows.push({ kind: 'nokeys', app });
+    for (const s of statuses) rows.push({ kind: 'key', app, key: s.key, status: s.status });
+  }
+  return rows;
+}
+
+function rowKey(row: Row): string {
+  if (row.kind === 'key') return `key:${row.key.key_id}`;
+  return `${row.kind}:${row.app.id}`;
+}
+
 export function AppsTab() {
   const { isAdmin } = useSession();
   const role = useRole();
+  const now = useNow();
   const apps = useResource((s) => api.apps(s), []);
   const [creating, setCreating] = useState(false);
   const [notice, setNotice] = useState<NoticeMessage | null>(null);
@@ -79,18 +107,189 @@ export function AppsTab() {
     }
   };
 
+  const columns: Column<Row>[] = [
+    {
+      id: 'name',
+      header: 'App or key id',
+      cell: (row) => {
+        if (row.kind === 'app') {
+          return (
+            <div className="py-0.5">
+              <span className="flex min-w-0 items-center gap-2">
+                <MonoId value={row.app.name} className="font-medium text-bone" />
+                <span className="inline-flex h-5 shrink-0 items-center rounded-sm border border-line-control/50 px-1.5 font-mono text-2xs text-text-2" title="Environment">
+                  <span className="sr-only">environment </span>
+                  {row.app.environment}
+                </span>
+              </span>
+              {row.app.description ? <div className="text-xs text-text-3">{row.app.description}</div> : null}
+            </div>
+          );
+        }
+        if (row.kind === 'nokeys') {
+          return (
+            <span className="block pl-5 text-text-3">
+              No API keys.{isAdmin ? ' Issue one so this app can call the gateway.' : ''}
+            </span>
+          );
+        }
+        return (
+          <span className="flex items-center gap-1.5 pl-5">
+            <KeyRound aria-hidden="true" className="size-3 shrink-0 text-text-3" />
+            <code className="font-mono">{row.key.key_id}</code>
+          </span>
+        );
+      },
+    },
+    {
+      id: 'status',
+      header: 'Status',
+      nowrap: true,
+      cell: (row) => {
+        if (row.kind === 'app') {
+          return (
+            <>
+              <StatusBadge domain="app" value={row.app.disabled ? 'disabled' : 'enabled'} />
+              <div className="pt-0.5 text-2xs text-text-2 tabular-nums">
+                {formatInt(row.active)} of {plural(row.app.keys.length, 'key')} active
+              </div>
+            </>
+          );
+        }
+        if (row.kind === 'nokeys') return null;
+        return (
+          <span className="inline-flex items-center gap-1.5">
+            <StatusBadge domain="key" value={row.status} />
+            {row.key.revoked_at ? <Time value={row.key.revoked_at} className="text-text-3" /> : null}
+          </span>
+        );
+      },
+    },
+    {
+      id: 'dates',
+      header: 'Created, expiry and last use',
+      label: 'Dates',
+      cell: (row) => {
+        if (row.kind === 'app') {
+          return (
+            <span className="whitespace-nowrap text-text-2">
+              created <Time value={row.app.created_at} />
+            </span>
+          );
+        }
+        if (row.kind === 'nokeys') return null;
+        return (
+          <span className="flex flex-wrap gap-x-3 text-text-2">
+            <span className="whitespace-nowrap">
+              created <Time value={row.key.created_at} />
+            </span>
+            <span className="whitespace-nowrap">
+              expires <Time value={row.key.expires_at} fallback="never" future />
+            </span>
+            <span className="whitespace-nowrap">
+              used <Time value={row.key.last_used_at} fallback="never" />
+            </span>
+          </span>
+        );
+      },
+    },
+  ];
+
+  if (isAdmin) {
+    columns.push({
+      id: 'actions',
+      header: 'Actions',
+      srOnlyHeader: true,
+      align: 'right',
+      nowrap: true,
+      cell: (row) => {
+        if (row.kind === 'app') {
+          const app = row.app;
+          return (
+            <span className="inline-flex items-center justify-end gap-1.5">
+              <Button type="button" variant="outline" size="sm" onClick={() => setIssueFor(app)} aria-label={`Issue a key for ${app.name}`}>
+                Issue key
+              </Button>
+              {app.disabled ? (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  aria-busy={enabling === app.id || undefined}
+                  aria-disabled={enabling === app.id || undefined}
+                  aria-label={`Enable ${app.name}`}
+                  onClick={() => {
+                    if (enabling === null) void enable(app);
+                  }}
+                >
+                  {enabling === app.id ? <Spinner className="text-current" /> : null}
+                  {enabling === app.id ? 'Enabling…' : 'Enable'}
+                </Button>
+              ) : (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  aria-label={`Disable ${app.name}`}
+                  onClick={() => {
+                    setPendingError(null);
+                    setPending({ kind: 'disable', app });
+                  }}
+                >
+                  Disable
+                </Button>
+              )}
+            </span>
+          );
+        }
+        if (row.kind === 'key' && row.status !== 'revoked') {
+          const { app, key } = row;
+          return (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="text-bad hover:bg-bad-subtle hover:text-bad"
+              aria-label={`Revoke key ${key.key_id} of ${app.name}`}
+              onClick={() => {
+                setPendingError(null);
+                setPending({ kind: 'revoke', app, key });
+              }}
+            >
+              Revoke
+            </Button>
+          );
+        }
+        return null;
+      },
+    });
+  }
+
+  const items = apps.data;
+  const summary = items ? `${plural(items.length, 'app')} · ${plural(items.reduce((n, a) => n + a.keys.length, 0), 'key')}` : null;
+
   return (
-    <div className="stack">
-      <Panel
+    <div className="flex flex-col gap-4">
+      <Section
         title="Apps"
         description="Each app has an environment, so traffic from test apps can be told apart from pilot and production."
         actions={
-          isAdmin ? (
-            <button type="button" className="button" aria-expanded={creating} onClick={() => setCreating((c) => !c)}>
-              <IconPlus />
-              New app
-            </button>
-          ) : null
+          <>
+            {apps.refreshing ? (
+              <span className="inline-flex items-center gap-1.5 text-xs text-text-3" role="status">
+                <Spinner />
+                Refreshing…
+              </span>
+            ) : summary ? (
+              <span className="text-2xs text-text-3 tabular-nums">{summary}</span>
+            ) : null}
+            {isAdmin ? (
+              <Button type="button" variant="outline" size="sm" aria-expanded={creating} onClick={() => setCreating((c) => !c)}>
+                <Plus aria-hidden="true" />
+                New app
+              </Button>
+            ) : null}
+          </>
         }
         flush
       >
@@ -104,32 +303,41 @@ export function AppsTab() {
             }}
           />
         ) : null}
-        <Notice notice={notice} />
-        {actionError ? (
-          <div className="panel-inset">
-            <InlineError error={actionError} prefix="The app was not changed." />
+        {notice || actionError || (items && apps.error) ? (
+          <div className="flex flex-col items-start gap-2 border-b border-hairline px-3 py-2">
+            <Notice notice={notice} />
+            {actionError ? <InlineError error={actionError} prefix="The app was not changed." /> : null}
+            {items && apps.error ? <InlineError error={apps.error} prefix="Could not refresh; showing the last data loaded." onRetry={apps.reload} /> : null}
           </div>
         ) : null}
-        <Async resource={apps} loadingLabel="Loading apps…">
-          {(items) => (
-            <AppsTable
-              apps={items}
-              isAdmin={isAdmin}
-              enabling={enabling}
-              onIssue={setIssueFor}
-              onRevoke={(app, key) => {
-                setPendingError(null);
-                setPending({ kind: 'revoke', app, key });
-              }}
-              onDisable={(app) => {
-                setPendingError(null);
-                setPending({ kind: 'disable', app });
-              }}
-              onEnable={(app) => void enable(app)}
-            />
-          )}
-        </Async>
-      </Panel>
+        <div aria-busy={apps.loading || apps.refreshing || undefined}>
+          <DataTable
+            caption="Apps and their API keys"
+            columns={columns}
+            rows={items ? rowsOf(items, now) : null}
+            rowKey={rowKey}
+            loading={apps.loading}
+            error={apps.error}
+            onRetry={apps.reload}
+            skeletonRows={4}
+            rowProps={(row) => ({
+              className:
+                row.kind === 'app'
+                  ? 'bg-inset/50 border-t border-hairline first:border-t-0 sm:[&>td[data-pin]]:bg-[color-mix(in_srgb,var(--inset)_50%,var(--panel))]'
+                  : row.kind === 'key' && row.status === 'revoked'
+                    ? '[&>td]:text-text-3 [&_code]:text-text-3'
+                    : undefined,
+            })}
+            empty={
+              <EmptyState title="No apps yet.">
+                An app is the identity an application uses to call the gateway.{' '}
+                {isAdmin ? 'Create one, then issue it an API key.' : 'An admin can create one.'} On the host:{' '}
+                <code className="font-mono text-xs">ferry app create NAME --environment test</code>.
+              </EmptyState>
+            }
+          />
+        </div>
+      </Section>
 
       {issueFor ? (
         <IssueKeyDialog
@@ -144,9 +352,7 @@ export function AppsTab() {
 
       <ConfirmDialog
         open={pending !== null}
-        title={
-          pending?.kind === 'revoke' ? `Revoke key ${pending.key.key_id}?` : pending ? `Disable app ${pending.app.name}?` : ''
-        }
+        title={pending?.kind === 'revoke' ? `Revoke key ${pending.key.key_id}?` : pending ? `Disable app ${pending.app.name}?` : ''}
         confirmLabel={pending?.kind === 'revoke' ? 'Revoke key' : 'Disable app'}
         busyLabel={pending?.kind === 'revoke' ? 'Revoking…' : 'Disabling…'}
         danger
@@ -157,207 +363,17 @@ export function AppsTab() {
       >
         {pending?.kind === 'revoke' ? (
           <p>
-            Requests from <strong>{pending.app.name}</strong> with this key are rejected from now on. Revocation cannot be undone;
-            issue a new key if the app still needs access.
+            Requests from <strong className="font-medium">{pending.app.name}</strong> with this key are rejected from now on. Revocation
+            cannot be undone; issue a new key if the app still needs access.
           </p>
         ) : pending ? (
           <p>
-            Every key of <strong>{pending.app.name}</strong> is rejected until the app is enabled again. The keys are not revoked.
+            Every key of <strong className="font-medium">{pending.app.name}</strong> is rejected until the app is enabled again. The keys are
+            not revoked.
           </p>
         ) : null}
       </ConfirmDialog>
     </div>
-  );
-}
-
-function AppsTable({
-  apps,
-  isAdmin,
-  enabling,
-  onIssue,
-  onRevoke,
-  onDisable,
-  onEnable,
-}: {
-  apps: readonly App[];
-  isAdmin: boolean;
-  enabling: number | null;
-  onIssue: (app: App) => void;
-  onRevoke: (app: App, key: ApiKeySummary) => void;
-  onDisable: (app: App) => void;
-  onEnable: (app: App) => void;
-}) {
-  const now = useNow();
-  if (apps.length === 0) {
-    return (
-      <EmptyState title="No apps yet.">
-        An app is the identity an application uses to call the gateway.{' '}
-        {isAdmin ? 'Create one, then issue it an API key.' : 'An admin can create one.'} On the host:{' '}
-        <code>ferry app create NAME --environment test</code>.
-      </EmptyState>
-    );
-  }
-  const columns = isAdmin ? 6 : 5;
-  return (
-    <div className="table-wrap">
-      <table className="table">
-        <caption className="sr-only">Apps and their API keys</caption>
-        <thead>
-          <tr>
-            <th scope="col">App</th>
-            <th scope="col">Environment</th>
-            <th scope="col">Status</th>
-            <th scope="col" className="num">
-              Active keys
-            </th>
-            <th scope="col">Created</th>
-            {isAdmin ? (
-              <th scope="col" className="actions">
-                <span className="sr-only">Actions</span>
-              </th>
-            ) : null}
-          </tr>
-        </thead>
-        <tbody>
-          {apps.map((app) => {
-            const active = app.keys.filter((k) => keyStatus(k, now) === 'active').length;
-            return (
-              <Fragment key={app.id}>
-                <tr className="has-subrow">
-                  <td>
-                    <code className="strong">{app.name}</code>
-                    {app.description ? <div className="cell-note">{app.description}</div> : null}
-                  </td>
-                  <td>
-                    <span className="tag">{app.environment}</span>
-                  </td>
-                  <td>
-                    <StatusBadge domain="app" value={app.disabled ? 'disabled' : 'enabled'} />
-                  </td>
-                  <td className="num">
-                    {formatInt(active)}
-                    <span className="subtle"> of {formatInt(app.keys.length)}</span>
-                  </td>
-                  <td>
-                    <Time value={app.created_at} />
-                  </td>
-                  {isAdmin ? (
-                    <td className="actions">
-                      <div className="row">
-                        <button type="button" className="button button--small" onClick={() => onIssue(app)} aria-label={`Issue a key for ${app.name}`}>
-                          Issue key
-                        </button>
-                        {app.disabled ? (
-                          <button
-                            type="button"
-                            className="button button--small"
-                            aria-disabled={enabling === app.id || undefined}
-                            aria-label={`Enable ${app.name}`}
-                            onClick={() => {
-                              if (enabling === null) onEnable(app);
-                            }}
-                          >
-                            {enabling === app.id ? 'Enabling…' : 'Enable'}
-                          </button>
-                        ) : (
-                          <button type="button" className="button button--small button--ghost" onClick={() => onDisable(app)} aria-label={`Disable ${app.name}`}>
-                            Disable
-                          </button>
-                        )}
-                      </div>
-                    </td>
-                  ) : null}
-                </tr>
-                <tr className="subrow">
-                  <td colSpan={columns}>
-                    <KeysTable app={app} isAdmin={isAdmin} now={now} onRevoke={onRevoke} />
-                  </td>
-                </tr>
-              </Fragment>
-            );
-          })}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
-function KeysTable({
-  app,
-  isAdmin,
-  now,
-  onRevoke,
-}: {
-  app: App;
-  isAdmin: boolean;
-  now: number;
-  onRevoke: (app: App, key: ApiKeySummary) => void;
-}) {
-  if (app.keys.length === 0) {
-    return <p className="cell-note">No API keys. {isAdmin ? 'Issue one so this app can call the gateway.' : ''}</p>;
-  }
-  return (
-    <table className="table table--compact table--nested">
-      <caption className="sr-only">API keys of {app.name}</caption>
-      <thead>
-        <tr>
-          <th scope="col">Key id</th>
-          <th scope="col">Status</th>
-          <th scope="col">Created</th>
-          <th scope="col">Expires</th>
-          <th scope="col">Last used</th>
-          {isAdmin ? (
-            <th scope="col" className="actions">
-              <span className="sr-only">Actions</span>
-            </th>
-          ) : null}
-        </tr>
-      </thead>
-      <tbody>
-        {app.keys.map((k) => {
-          const status = keyStatus(k, now);
-          return (
-            <tr key={k.key_id}>
-              <td>
-                <code>{k.key_id}</code>
-              </td>
-              <td>
-                <StatusBadge domain="key" value={status} />
-                {k.revoked_at ? (
-                  <span className="cell-note">
-                    {' '}
-                    <Time value={k.revoked_at} />
-                  </span>
-                ) : null}
-              </td>
-              <td>
-                <Time value={k.created_at} />
-              </td>
-              <td>
-                <Time value={k.expires_at} fallback="never" future />
-              </td>
-              <td>
-                <Time value={k.last_used_at} fallback="never" />
-              </td>
-              {isAdmin ? (
-                <td className="actions">
-                  {status === 'revoked' ? null : (
-                    <button
-                      type="button"
-                      className="button button--small button--ghost text-bad"
-                      onClick={() => onRevoke(app, k)}
-                      aria-label={`Revoke key ${k.key_id} of ${app.name}`}
-                    >
-                      Revoke
-                    </button>
-                  )}
-                </td>
-              ) : null}
-            </tr>
-          );
-        })}
-      </tbody>
-    </table>
   );
 }
 
@@ -395,37 +411,47 @@ function CreateAppForm({ onCreated, onCancel }: { onCreated: (name: string) => v
   };
 
   return (
-    <form className="form form-panel" onSubmit={(e) => void submit(e)} noValidate aria-label="New app">
-      <div className="form-grid">
-        <Field label="Name" error={errors.fields['name']} hint="Policies refer to it as app:NAME.">
-          {(p) => (
-            <input {...p} className="input input--mono" value={name} onChange={(e) => setName(e.target.value)} autoComplete="off" spellCheck={false} />
-          )}
-        </Field>
-        <Field label="Environment" error={errors.fields['environment']}>
-          {(p) => (
-            <select {...p} className="select" value={environment} onChange={(e) => setEnvironment(e.target.value as Environment)}>
-              {ENVIRONMENTS.map((env) => (
-                <option key={env} value={env}>
-                  {env}
-                </option>
-              ))}
-            </select>
-          )}
-        </Field>
-        <Field label="Description" optional wide error={errors.fields['description']}>
-          {(p) => <input {...p} className="input" value={description} onChange={(e) => setDescription(e.target.value)} autoComplete="off" />}
-        </Field>
-      </div>
+    <form className="flex flex-col gap-3 border-b border-hairline bg-inset/40 px-3 py-3" onSubmit={(e) => void submit(e)} noValidate aria-label="New app">
+      <FormGrid>
+        <TextField
+          // Opened by the New app button: focus goes where the work is.
+          autoFocus
+          label="Name"
+          mono
+          error={errors.fields['name']}
+          hint="Policies refer to it as app:NAME."
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          autoComplete="off"
+          spellCheck={false}
+        />
+        <SelectField label="Environment" error={errors.fields['environment']} value={environment} onChange={(e) => setEnvironment(e.target.value as Environment)}>
+          {ENVIRONMENTS.map((env) => (
+            <option key={env} value={env}>
+              {env}
+            </option>
+          ))}
+        </SelectField>
+        <TextField
+          label="Description"
+          optional
+          wide
+          error={errors.fields['description']}
+          value={description}
+          onChange={(e) => setDescription(e.target.value)}
+          autoComplete="off"
+        />
+      </FormGrid>
       <FormErrorList messages={errors.general} />
-      <div className="form-actions">
-        <button type="submit" className="button button--primary" aria-disabled={busy || undefined}>
+      <FormActions>
+        <Button type="submit" aria-busy={busy || undefined} aria-disabled={busy || undefined}>
+          {busy ? <Spinner className="text-current" /> : null}
           {busy ? 'Creating…' : 'Create app'}
-        </button>
-        <button type="button" className="button" onClick={onCancel}>
+        </Button>
+        <Button type="button" variant="outline" onClick={onCancel}>
           Cancel
-        </button>
-      </div>
+        </Button>
+      </FormActions>
     </form>
   );
 }

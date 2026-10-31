@@ -1,3 +1,4 @@
+import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
 import { defineConfig, type Plugin, type ProxyOptions } from 'vite';
 
@@ -13,9 +14,19 @@ import { defineConfig, type Plugin, type ProxyOptions } from 'vite';
 const NEUTRALISE: ReadonlyArray<readonly [RegExp, string]> = [
   // Message text only: keep the hint, drop the scheme.
   [/https:\/\/react\.dev\/errors\//g, 'react.dev/errors/'],
+  // Message text only: motion-utils formatErrorMessage appends this hint to
+  // its warnings and invariant errors. Keep the hint, drop the scheme.
+  [/https:\/\/motion\.dev\/troubleshooting\//g, 'motion.dev/troubleshooting/'],
   // Inside a JS string literal `\/` is the same character as `/`, so the
   // namespace values react-dom passes to createElementNS are unchanged.
   [/http:\/\/www\.w3\.org\//g, 'http:\\/\\/www.w3.org/'],
+  // Tailwind's preserved license banner comment at the top of the built CSS.
+  [/https:\/\/tailwindcss\.com/g, 'tailwindcss.com'],
+  // Message text only: @base-ui/utils formatErrorMessage passes this through
+  // new URL() to name the page in a production error message, so dropping the
+  // scheme would replace that message with a TypeError. Escaped like the
+  // namespace above: the string is unchanged at runtime and never fetched.
+  [/https:\/\/base-ui\.com\/production-error/g, 'https:\\/\\/base-ui.com/production-error'],
 ];
 
 const SCHEME_URL = /https?:\/\//i;
@@ -45,6 +56,11 @@ function offlineGuard(): Plugin {
             file.code = file.code.replace(pattern, replacement);
           }
           text = file.code;
+        } else if (file.fileName.endsWith('.css') && typeof file.source === 'string') {
+          for (const [pattern, replacement] of NEUTRALISE) {
+            file.source = file.source.replace(pattern, replacement);
+          }
+          text = file.source;
         } else {
           text = typeof file.source === 'string' ? file.source : new TextDecoder('latin1').decode(file.source);
         }
@@ -65,6 +81,31 @@ function offlineGuard(): Plugin {
   };
 }
 
+/**
+ * Sonner calls `__insertCSS("...")` when its module loads, which appends a
+ * <style> element. The gateway's `style-src 'self'` refuses it, so every page
+ * load would log two CSP violations (the empty element, then its text). The
+ * same stylesheet is imported from `sonner/dist/styles.css` in index.css and
+ * ships in the bundle's CSS file, so the call is removed here. The build fails
+ * if the call is no longer found, so a Sonner upgrade cannot quietly bring the
+ * injection back.
+ */
+const SONNER_INSERT_CSS = /__insertCSS\("(?:[^"\\]|\\.)*"\);?/;
+
+function cspSafeSonner(): Plugin {
+  return {
+    name: 'ferry-csp-safe-sonner',
+    apply: 'build',
+    transform(code, id) {
+      if (!/[\\/]node_modules[\\/]sonner[\\/]dist[\\/]index\.mjs$/.test(id)) return null;
+      if (!SONNER_INSERT_CSS.test(code)) {
+        this.error("sonner no longer calls __insertCSS(\"...\"): check how it injects its stylesheet; style-src 'self' refuses <style> elements");
+      }
+      return { code: code.replace(SONNER_INSERT_CSS, ''), map: null };
+    },
+  };
+}
+
 // changeOrigin stays false so the backend sees the browser's Host header and
 // its Origin check (spec section 6) passes for requests made through the proxy.
 const backend: ProxyOptions = { target: 'http://127.0.0.1:8750', changeOrigin: false };
@@ -72,7 +113,9 @@ const proxy = { '/api': backend, '/v1': backend, '/healthz': backend };
 
 export default defineConfig({
   base: '/',
-  plugins: [react(), offlineGuard()],
+  plugins: [tailwindcss(), react(), cspSafeSonner(), offlineGuard()],
+  // Resolved from this file's URL so the alias needs no node typings in tsconfig.
+  resolve: { alias: { '@': decodeURIComponent(new URL('./src', import.meta.url).pathname) } },
   build: {
     outDir: '../ferry/static',
     emptyOutDir: true,

@@ -25,9 +25,18 @@ STATIC = ROOT / "ferry" / "static"
 SRC = WEB / "src"
 
 ALLOWED_PACKAGES = {
-    "react", "react-dom", "typescript", "vite", "@vitejs/plugin-react", "@types/react",
-    "@types/react-dom", "@fontsource/ibm-plex-sans", "@fontsource/ibm-plex-mono",
+    # runtime
+    "react", "react-dom", "@fontsource-variable/archivo", "@fontsource/azeret-mono",
+    "@base-ui/react", "class-variance-authority", "cn",
+    "lucide-react", "motion", "cmdk", "sonner",
+    # build-time only (nothing of these ships into ferry/static as JS)
+    "typescript", "vite", "@vitejs/plugin-react", "@types/react", "@types/react-dom",
+    "tailwindcss", "@tailwindcss/vite", "tw-animate-css", "shadcn",
 }
+# Vendored component sources (shadcn output and effect components) set CSS
+# variables through the style prop; React applies those via the CSSOM, which
+# style-src 'self' allows. Every other source rule still applies to them.
+VENDORED = ("components/ui/", "components/fx/")
 SCHEME = re.compile(rb"https?://", re.IGNORECASE)
 TEXT_SUFFIXES = {".html", ".js", ".mjs", ".css", ".json", ".svg", ".txt", ".md", ".webmanifest"}
 
@@ -96,7 +105,7 @@ def test_build_has_entry_script_styles_and_fonts() -> None:
     assert any(n.startswith("assets/") and n.endswith(".js") for n in names)
     assert any(n.startswith("assets/") and n.endswith(".css") for n in names)
     fonts = [n for n in names if n.endswith(".woff2")]
-    assert any("ibm-plex-sans" in n for n in fonts) and any("ibm-plex-mono" in n for n in fonts)
+    assert any("archivo" in n for n in fonts) and any("azeret-mono" in n for n in fonts)
     assert not [n for n in names if n.endswith((".ttf", ".otf", ".woff", ".eot"))], "only woff2 fonts are referenced"
 
 
@@ -160,16 +169,36 @@ def test_no_source_maps_service_workers_or_eval() -> None:
             assert not re.search(r"new\s+Function\s*\(", text), f"{name}: new Function (blocked by script-src 'self')"
 
 
+def test_toast_styles_ship_as_a_file_not_an_injected_style_element() -> None:
+    """Sonner injects its stylesheet as a <style> element at import, which
+    style-src 'self' refuses (two CSP violations per page load). vite.config.ts
+    strips the injection; the same rules ship in the built CSS file instead."""
+    js = "".join(p.read_text(encoding="utf-8") for p in built_files() if p.suffix == ".js")
+    css = "".join(p.read_text(encoding="utf-8") for p in built_files() if p.suffix == ".css")
+    assert "[data-sonner-toaster][dir=ltr]" not in js, "sonner's runtime <style> injection is back in the bundle"
+    assert "[data-sonner-toaster]" in css, "the toast stylesheet is missing from the built CSS"
+
+
 def test_bundle_size_budget() -> None:
-    """Catches an accidental heavy dependency; today the JS is ~380 KiB raw, ~107 KiB gzip."""
+    """Catches an accidental heavy dependency.
+
+    Budget for the Tailwind v4 + shadcn (Base UI) + motion + vendored effect
+    component stack. The hand-written console (IBM Plex fonts) was ~380 KiB raw /
+    ~107 KiB gzip of JS and ~31 KiB of CSS. The redesigned console measures
+    ~889 KiB raw / ~274 KiB gzip of JS in one chunk (react-dom, the app, Base UI
+    and motion are most of it), ~135 KiB of CSS (preflight, shadcn theme,
+    tw-animate-css, Sonner's toast rules) and ~207 KiB of woff2 fonts (Archivo
+    Variable and Azeret Mono, latin and latin-ext only). The limits leave room
+    to grow and catch a heavy dependency.
+    """
     js = sum(p.stat().st_size for p in built_files() if p.suffix == ".js")
     js_gz = sum(len(gzip.compress(p.read_bytes(), 9)) for p in built_files() if p.suffix == ".js")
     css = sum(p.stat().st_size for p in built_files() if p.suffix == ".css")
     total = sum(p.stat().st_size for p in built_files())
-    assert js < 600 * 1024, f"JS is {js} bytes"
-    assert js_gz < 180 * 1024, f"JS is {js_gz} bytes gzipped"
-    assert css < 80 * 1024, f"CSS is {css} bytes"
-    assert total < 1024 * 1024, f"build is {total} bytes"
+    assert js < 1536 * 1024, f"JS is {js} bytes"
+    assert js_gz < 450 * 1024, f"JS is {js_gz} bytes gzipped"
+    assert css < 300 * 1024, f"CSS is {css} bytes"
+    assert total < 3 * 1024 * 1024, f"build is {total} bytes"
 
 
 # ----------------------------------------------------------------- sources
@@ -200,6 +229,8 @@ def test_only_the_api_client_calls_fetch() -> None:
 def test_sources_avoid(pattern: str, why: str) -> None:
     hits = []
     for path in source_files():
+        if why.startswith("inline style props") and path.relative_to(SRC).as_posix().startswith(VENDORED):
+            continue
         text = path.read_text(encoding="utf-8")
         if path.suffix != ".css":
             text = _strip_comments(text)

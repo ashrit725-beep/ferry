@@ -13,3 +13,12 @@ ferry-data/
 *.ferry.tar.sha256
 *.review.md
 .DS_Store
+
+# Impeccable (per-machine state)
+.impeccable/config.local.json
+.impeccable/hook.cache.json
+.impeccable/live/
+.impeccable/review/
+.impeccable/mocks/
+.impeccable/build/
+.claude/settings.local.json

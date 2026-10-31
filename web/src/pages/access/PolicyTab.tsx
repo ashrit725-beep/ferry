@@ -2,10 +2,12 @@
  * Policy editor: a JSON document checked locally for syntax, validated by the
  * server (errors with paths, warnings by rule), and activated as a new,
  * immutable version. Rolling back means loading an old version and
- * activating it again.
+ * activating it again. Findings are read as a checklist: the document line
+ * first, then one line per error and warning.
  */
 
-import { useId, useRef, useState } from 'react';
+import { useRef, useState } from 'react';
+import { toast } from 'sonner';
 import {
   ApiError,
   activationValidation,
@@ -23,14 +25,21 @@ import { formatInt, plural } from '../../format.ts';
 import { useResource } from '../../hooks.ts';
 import { offsetOf, parseJson, prettyJson, sameDocument } from '../../json.ts';
 import { useRole, useSession } from '../../session.tsx';
-import { ConfirmDialog, Dialog } from '../../components/Dialog.tsx';
-import { Digest } from '../../components/Digest.tsx';
-import { Field } from '../../components/Field.tsx';
-import { JsonView } from '../../components/JsonView.tsx';
-import { Callout, DefList, Panel } from '../../components/Panel.tsx';
-import { Async, EmptyState, InlineError } from '../../components/States.tsx';
-import { Badge } from '../../components/StatusBadge.tsx';
-import { Time } from '../../components/Time.tsx';
+import { Callout } from '../../components/console/callout.tsx';
+import { Checklist, ChecklistLine } from '../../components/console/checklist.tsx';
+import { ConfirmDialog } from '../../components/console/confirm-dialog.tsx';
+import { DataTable } from '../../components/console/data-table.tsx';
+import { Dialog } from '../../components/console/dialog.tsx';
+import { Digest } from '../../components/console/digest.tsx';
+import { FormActions, TextField } from '../../components/console/form-field.tsx';
+import { JsonView } from '../../components/console/json-view.tsx';
+import { KeyValueList } from '../../components/console/key-value-list.tsx';
+import { Section } from '../../components/console/section.tsx';
+import { Stamp } from '../../components/console/stamp.tsx';
+import { Async, EmptyState, InlineError, PanelSkeleton, Spinner } from '../../components/console/states.tsx';
+import { Time } from '../../components/console/time.tsx';
+import { Button } from '../../components/ui/button.tsx';
+import { PolicyEditor, type EditorHandle } from './PolicyEditor.tsx';
 
 interface Source {
   label: string;
@@ -42,6 +51,8 @@ interface Checked {
   result: PolicyValidation;
   /** Came back from a refused activation rather than from Validate. */
   fromActivation: boolean;
+  /** Redraws the checklist when the same document is checked again. */
+  serial: number;
 }
 
 interface ParseProblem {
@@ -56,6 +67,10 @@ function activeSource(state: PolicyState): Source {
   return active
     ? { label: `active version ${active.version}`, text: prettyJson(active.document) }
     : { label: 'the empty policy (no policy is active yet)', text: prettyJson(EMPTY_POLICY) };
+}
+
+function ruleCount(doc: unknown): number {
+  return isObject(doc) && Array.isArray(doc['rules']) ? doc['rules'].length : 0;
 }
 
 export function PolicyTab() {
@@ -75,10 +90,8 @@ export function PolicyTab() {
   const [activateError, setActivateError] = useState<string | null>(null);
   const [activated, setActivated] = useState<Activation | null>(null);
   const [viewing, setViewing] = useState<number | null>(null);
-  const editorRef = useRef<HTMLTextAreaElement>(null);
-  const editorId = useId();
-  const hintId = useId();
-  const parseId = useId();
+  const editorRef = useRef<EditorHandle>(null);
+  const commentRef = useRef<HTMLInputElement>(null);
 
   const source = loaded ?? (policy.data ? activeSource(policy.data) : null);
   const text = draft ?? source?.text ?? '';
@@ -93,14 +106,7 @@ export function PolicyTab() {
       return { value: parsed.value };
     }
     setParseProblem({ text, message: parsed.message, line: parsed.line, column: parsed.column });
-    const el = editorRef.current;
-    if (el) {
-      el.focus();
-      if (parsed.line !== null && parsed.column !== null) {
-        const pos = offsetOf(text, parsed.line, parsed.column);
-        el.setSelectionRange(pos, pos);
-      }
-    }
+    editorRef.current?.focusAt(parsed.line !== null && parsed.column !== null ? offsetOf(text, parsed.line, parsed.column) : null);
     return null;
   };
 
@@ -111,7 +117,8 @@ export function PolicyTab() {
     setValidating(true);
     setRequestError(null);
     try {
-      setChecked({ text, result: await api.validatePolicy(parsed.value), fromActivation: false });
+      const result = await api.validatePolicy(parsed.value);
+      setChecked((prev) => ({ text, result, fromActivation: false, serial: (prev?.serial ?? 0) + 1 }));
     } catch (err) {
       setRequestError(err);
     } finally {
@@ -130,6 +137,7 @@ export function PolicyTab() {
     if (!parsed) return;
     if (!comment.trim()) {
       setCommentError('Say why this policy is being activated. The comment is stored with the version and in the audit log.');
+      commentRef.current?.focus();
       return;
     }
     setCommentError(null);
@@ -151,10 +159,11 @@ export function PolicyTab() {
       setChecked(null);
       setConfirm(null);
       policy.reload();
+      toast.success(`Policy v${result.version} activated`, { description: `SHA-256 ${result.sha256}` });
     } catch (err) {
       const validation = err instanceof ApiError ? activationValidation(err) : null;
       if (validation) {
-        setChecked({ text: confirm.text, result: validation, fromActivation: true });
+        setChecked((prev) => ({ text: confirm.text, result: validation, fromActivation: true, serial: (prev?.serial ?? 0) + 1 }));
         setConfirm(null);
       } else if (appliedDespiteBody(err)) {
         setConfirm(null);
@@ -177,133 +186,116 @@ export function PolicyTab() {
   };
 
   return (
-    <div className="grid grid--split">
-      <Panel
+    <div className="grid grid-cols-1 items-start gap-4 min-[1181px]:grid-cols-[minmax(0,1fr)_minmax(320px,400px)]">
+      <Section
         title="Policy document"
         description={source ? <>Started from {source.label}.</> : null}
-        actions={dirty ? <span className="tag tag--attention">unsaved changes</span> : null}
+        actions={dirty ? <Stamp state="pending">Unsaved changes</Stamp> : null}
       >
         {policy.data === null ? (
-          <Async resource={policy} loadingLabel="Loading the policy…">
+          <Async resource={policy} skeleton={<PanelSkeleton lines={12} />}>
             {() => null}
           </Async>
         ) : (
-          <div className="form">
-            <div className="field">
-              <label className="field__label" htmlFor={editorId}>
-                Policy JSON <span className="field__optional">(schema ferry.dev/access-policy/v1)</span>
-              </label>
-              <textarea
-                id={editorId}
-                ref={editorRef}
-                className="textarea editor"
-                value={text}
-                onChange={(e) => setDraft(e.target.value)}
-                spellCheck={false}
-                autoCapitalize="off"
-                autoComplete="off"
-                autoCorrect="off"
-                rows={24}
-                aria-describedby={currentParse ? `${parseId} ${hintId}` : hintId}
-                aria-invalid={currentParse ? true : undefined}
-              />
-              {currentParse ? (
-                <p id={parseId} className="field__error" role="alert">
-                  Not valid JSON: {currentParse.message}
-                  {currentParse.line !== null ? ` (line ${currentParse.line}, column ${currentParse.column})` : ''}.
-                </p>
-              ) : null}
-              <p id={hintId} className="field__hint">
-                A matching deny always wins; otherwise a matching allow allows; anything else is denied. Principals are{' '}
-                <code>app:NAME</code>, <code>app:*</code> or <code>*</code>; models an exact name, <code>*</code>, or a prefix such
-                as <code>qwen-*</code>.
-              </p>
-            </div>
-            <div className="form-actions">
-              <button type="button" className="button" onClick={() => void validate()} aria-disabled={validating || undefined}>
+          <div className="flex flex-col gap-3">
+            <PolicyEditor
+              ref={editorRef}
+              value={text}
+              onChange={setDraft}
+              parseProblem={currentParse}
+              hint={
+                <>
+                  A matching deny always wins; otherwise a matching allow allows; anything else is denied. Principals are{' '}
+                  <code className="code-inline font-mono text-text-2">app:NAME</code>, <code className="code-inline font-mono text-text-2">app:*</code> or <code className="code-inline font-mono text-text-2">*</code>; models
+                  an exact name, <code className="code-inline font-mono text-text-2">*</code>, or a prefix such as <code className="code-inline font-mono text-text-2">qwen-*</code>.
+                </>
+              }
+            />
+            <FormActions>
+              <Button type="button" variant="outline" onClick={() => void validate()} aria-busy={validating || undefined} aria-disabled={validating || undefined}>
+                {validating ? <Spinner className="text-current" /> : null}
                 {validating ? 'Validating…' : 'Validate'}
-              </button>
-              <button type="button" className="button button--ghost" onClick={format}>
+              </Button>
+              <Button type="button" variant="ghost" onClick={format}>
                 Format JSON
-              </button>
+              </Button>
               {dirty ? (
-                <button type="button" className="button button--ghost" onClick={() => setDraft(null)}>
+                <Button type="button" variant="ghost" onClick={() => setDraft(null)}>
                   Discard changes
-                </button>
+                </Button>
               ) : null}
               {loaded ? (
-                <button
+                <Button
                   type="button"
-                  className="button button--ghost"
+                  variant="ghost"
                   onClick={() => {
                     setLoaded(null);
                     setDraft(null);
                   }}
                 >
                   Start from the active policy
-                </button>
+                </Button>
               ) : null}
-            </div>
-            <div className="validation-area">
-              {currentCheck ? (
-                <ValidationResult check={currentCheck} />
-              ) : checked ? (
-                <p className="field__hint">The document has changed since it was last checked.</p>
-              ) : null}
-              {requestError ? <InlineError error={requestError} prefix="Validation did not run." /> : null}
-            </div>
-            {isAdmin ? (
-              <div className="activate-box">
-                <h3>Activate</h3>
-                <Field label="Comment" error={commentError} hint="Why this change is being made. Stored with the version and in the audit log.">
-                  {(p) => (
-                    <input {...p} className="input" value={comment} onChange={(e) => setComment(e.target.value)} maxLength={1000} autoComplete="off" />
-                  )}
-                </Field>
-                <div className="form-actions">
-                  <button type="button" className="button button--primary" onClick={startActivate}>
-                    Activate as a new version
-                  </button>
-                </div>
-                {activated ? (
-                  <Callout tone="ok" role="status" title={`Activated version ${activated.version}`}>
-                    <p>
-                      It applies from the next gateway request. SHA-256 <Digest value={activated.sha256} label="policy sha256" />
-                    </p>
-                    {activated.warnings.length ? (
-                      <ul>
-                        {activated.warnings.map((w, i) => (
-                          <li key={i}>
-                            {w.rule_id ? <code>{w.rule_id}</code> : null} {w.message}
-                          </li>
-                        ))}
-                      </ul>
-                    ) : null}
-                  </Callout>
+            </FormActions>
+
+            {currentCheck || checked || requestError ? (
+              <div className="flex flex-col gap-2">
+                {currentCheck ? (
+                  <ValidationResult check={currentCheck} />
+                ) : checked ? (
+                  <p className="text-xs text-text-3">The document has changed since it was last checked.</p>
                 ) : null}
+                {requestError ? <InlineError error={requestError} prefix="Validation did not run." /> : null}
+              </div>
+            ) : null}
+
+            {isAdmin ? (
+              <div className="mt-1 flex flex-col gap-3 border-t border-hairline pt-3">
+                <h3 className="text-2xs font-medium tracking-[0.14em] text-text-3 uppercase">Activate</h3>
+                <TextField
+                  ref={commentRef}
+                  label="Comment"
+                  error={commentError}
+                  hint="Why this change is being made. Stored with the version and in the audit log."
+                  value={comment}
+                  onChange={(e) => setComment(e.target.value)}
+                  maxLength={1000}
+                  autoComplete="off"
+                />
+                <FormActions>
+                  <Button type="button" onClick={startActivate}>
+                    Activate as a new version
+                  </Button>
+                </FormActions>
+                {activated ? <ActivatedResult activated={activated} /> : null}
               </div>
             ) : (
-              <p className="field__hint">Validation is open to every role. Activating a policy requires the admin role.</p>
+              <p className="border-t border-hairline pt-3 text-xs text-text-3">Validation is open to every role. Activating a policy requires the admin role.</p>
             )}
           </div>
         )}
-      </Panel>
+      </Section>
 
-      <div className="stack">
-        <Panel title="Active policy">
-          <Async resource={policy} loadingLabel="Loading…">
+      <div className="flex min-w-0 flex-col gap-4">
+        <Section title="Active policy">
+          <Async resource={policy} skeleton={<PanelSkeleton lines={6} />}>
             {(state) =>
               state.active ? (
-                <DefList
-                  items={[
-                    ['Version', <span className="num">v{state.active.version}</span>],
-                    ['Activated', <Time value={state.active.activated_at} exact />],
-                    ['Activated by', state.active.activated_by],
-                    ['Comment', state.active.comment || <span className="subtle">none</span>],
-                    ['Rules', <span className="num">{formatInt(ruleCount(state.active.document))}</span>],
-                    ['SHA-256', <Digest value={state.active.sha256} label="active policy sha256" />],
-                  ]}
-                />
+                <div className="flex flex-col gap-3">
+                  <Checklist as="div" ariaLabel="Policy in force">
+                    <ChecklistLine as="div" label="Policy in force" state="confirmed" value={`v${state.active.version}`} stamp="Active" drawKey={state.active.version} />
+                  </Checklist>
+                  <KeyValueList
+                    items={[
+                      { term: 'Version', value: `v${state.active.version}`, mono: true },
+                      ['Activated', <Time value={state.active.activated_at} exact />],
+                      ['Activated by', state.active.activated_by],
+                      ['Comment', state.active.comment || <span className="text-text-3">none</span>],
+                      { term: 'Rules', value: formatInt(ruleCount(state.active.document)), mono: true },
+                      ['SHA-256', <Digest value={state.active.sha256} label="active policy sha256" />],
+                    ]}
+                  />
+                </div>
               ) : (
                 <Callout tone="bad" title="No active policy">
                   <p>Every gateway request is denied until a policy is activated.</p>
@@ -311,12 +303,21 @@ export function PolicyTab() {
               )
             }
           </Async>
-        </Panel>
-        <Panel title="Version history" flush>
-          <Async resource={policy} loadingLabel="Loading…">
-            {(state) => <History items={state.history} onView={setViewing} />}
-          </Async>
-        </Panel>
+        </Section>
+        <Section
+          title="Version history"
+          flush
+          actions={
+            policy.refreshing ? (
+              <span className="inline-flex items-center gap-1.5 text-xs text-text-3" role="status">
+                <Spinner />
+                Refreshing…
+              </span>
+            ) : null
+          }
+        >
+          <History policy={policy.data} loading={policy.loading} error={policy.error} onRetry={policy.reload} onView={setViewing} />
+        </Section>
       </div>
 
       <ConfirmDialog
@@ -330,8 +331,8 @@ export function PolicyTab() {
         onCancel={() => setConfirm(null)}
       >
         <p>
-          The document {confirm?.rules !== null && confirm?.rules !== undefined ? `(${plural(confirm.rules, 'rule')}) ` : ''}is
-          stored as a new version and decides the next gateway request.
+          The document {confirm?.rules !== null && confirm?.rules !== undefined ? `(${plural(confirm.rules, 'rule')}) ` : ''}is stored as a new
+          version and decides the next gateway request.
           {policy.data?.active ? ` Version ${policy.data.active.version} stays in the history and can be activated again.` : ''}
         </p>
         <p>
@@ -339,123 +340,155 @@ export function PolicyTab() {
         </p>
       </ConfirmDialog>
 
-      {viewing !== null ? (
-        <VersionDialog version={viewing} dirty={dirty} onClose={() => setViewing(null)} onLoad={loadVersion} />
-      ) : null}
+      {viewing !== null ? <VersionDialog version={viewing} dirty={dirty} onClose={() => setViewing(null)} onLoad={loadVersion} /> : null}
     </div>
   );
-}
-
-function ruleCount(doc: unknown): number {
-  return isObject(doc) && Array.isArray(doc['rules']) ? doc['rules'].length : 0;
 }
 
 function ValidationResult({ check }: { check: Checked }) {
-  const { result, fromActivation } = check;
-  const warnings = result.warnings.length ? (
-    <ul>
-      {result.warnings.map((w, i) => (
-        <li key={i}>
-          {w.rule_id ? (
-            <>
-              <code>{w.rule_id}</code>:{' '}
-            </>
-          ) : null}
-          {w.message}
-        </li>
-      ))}
-    </ul>
-  ) : null;
-  if (result.valid) {
-    return (
-      <Callout
-        tone={result.warnings.length ? 'warn' : 'ok'}
-        role="status"
-        title={result.warnings.length ? `Valid, with ${plural(result.warnings.length, 'warning')}` : 'Valid, no warnings'}
-      >
-        {warnings}
-      </Callout>
-    );
-  }
+  const { result, fromActivation, serial } = check;
+  const warnings = result.warnings.length;
+  const title = result.valid
+    ? warnings
+      ? `Valid, with ${plural(warnings, 'warning')}`
+      : 'Valid, no warnings'
+    : `${fromActivation ? 'Not activated: ' : ''}${plural(result.errors.length, 'error')}`;
   return (
-    <Callout
-      tone="bad"
-      role="alert"
-      title={`${fromActivation ? 'Not activated: ' : ''}${plural(result.errors.length, 'error')}`}
-    >
-      <ul>
+    <div role={result.valid ? 'status' : 'alert'}>
+      <Checklist label="Validation" summary={`${plural(result.errors.length, 'error')} · ${plural(warnings, 'warning')}`} ariaLabel="Validation findings">
+        <ChecklistLine
+          label={title}
+          state={result.valid ? (warnings ? 'warning' : 'confirmed') : 'failed'}
+          stamp={result.valid ? 'Valid' : fromActivation ? 'Not activated' : 'Invalid'}
+          drawKey={serial}
+        />
         {result.errors.map((e, i) => (
-          <li key={i}>
-            <code>{e.path || 'document'}</code> {e.message}
-          </li>
+          <ChecklistLine
+            key={`e${i}`}
+            label={<code className="font-mono text-xs">{e.path || 'document'}</code>}
+            state="failed"
+            stamp="Error"
+            detail={<span className="text-text-2">{e.message}</span>}
+            drawKey={serial}
+          />
         ))}
-      </ul>
-      {warnings}
-    </Callout>
+        {result.warnings.map((w, i) => (
+          <ChecklistLine
+            key={`w${i}`}
+            label={w.rule_id ? <code className="font-mono text-xs">{w.rule_id}</code> : 'document'}
+            state="warning"
+            stamp="Warning"
+            detail={<span className="text-text-2">{w.message}</span>}
+            drawKey={serial}
+          />
+        ))}
+      </Checklist>
+    </div>
   );
 }
 
-function History({ items, onView }: { items: readonly PolicyHistoryItem[]; onView: (version: number) => void }) {
-  if (items.length === 0) {
-    return <EmptyState title="No policy has been activated yet.">Until one is, every gateway request is denied.</EmptyState>;
-  }
+function ActivatedResult({ activated }: { activated: Activation }) {
   return (
-    <div className="table-wrap">
-      <table className="table table--compact">
-        <caption className="sr-only">Policy versions, newest first</caption>
-        <thead>
-          <tr>
-            <th scope="col" className="num">
-              Version
-            </th>
-            <th scope="col">Created</th>
-            <th scope="col">Comment</th>
-            <th scope="col" className="actions">
-              <span className="sr-only">Actions</span>
-            </th>
-          </tr>
-        </thead>
-        <tbody>
-          {items.map((h) => (
-            <tr key={h.version}>
-              <td className="num">
-                v{h.version}
-                {h.active ? (
-                  <div>
-                    <Badge tone="ok">active</Badge>
-                  </div>
-                ) : null}
-              </td>
-              <td>
-                <Time value={h.created_at} />
-                <div className="cell-note">{h.created_by}</div>
-              </td>
-              <td className="break">{h.comment || <span className="subtle">none</span>}</td>
-              <td className="actions">
-                <button type="button" className="button button--small" onClick={() => onView(h.version)} aria-label={`View policy version ${h.version}`}>
-                  View
-                </button>
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+    <div role="status">
+      <Checklist ariaLabel="Activation result">
+        <ChecklistLine
+          label={`Activated version ${activated.version}`}
+          state="confirmed"
+          value={`v${activated.version}`}
+          stamp="Active"
+          drawKey={activated.version}
+          detail={
+            <span className="inline-flex flex-wrap items-center gap-x-1.5">
+              It applies from the next gateway request. SHA-256 <Digest value={activated.sha256} label="policy sha256" reveal />
+            </span>
+          }
+        />
+        {activated.warnings.map((w, i) => (
+          <ChecklistLine
+            key={i}
+            label={w.rule_id ? <code className="font-mono text-xs">{w.rule_id}</code> : 'document'}
+            state="warning"
+            stamp="Warning"
+            detail={<span className="text-text-2">{w.message}</span>}
+          />
+        ))}
+      </Checklist>
     </div>
+  );
+}
+
+function History({
+  policy,
+  loading,
+  error,
+  onRetry,
+  onView,
+}: {
+  policy: PolicyState | null;
+  loading: boolean;
+  error: unknown;
+  onRetry: () => void;
+  onView: (version: number) => void;
+}) {
+  const rows: readonly PolicyHistoryItem[] | null = policy ? policy.history : null;
+  return (
+    <DataTable
+      caption="Policy versions, newest first"
+      rows={rows}
+      rowKey={(h) => String(h.version)}
+      loading={loading}
+      error={error}
+      onRetry={onRetry}
+      skeletonRows={4}
+      maxHeight="max-h-[60vh]"
+      minWidth="min-w-0"
+      empty={<EmptyState title="No policy has been activated yet.">Until one is, every gateway request is denied.</EmptyState>}
+      columns={[
+        {
+          id: 'version',
+          header: 'Version',
+          nowrap: true,
+          cell: (h) => (
+            <span className="inline-flex items-center gap-1.5">
+              <span className="font-mono">v{h.version}</span>
+              {h.active ? <Stamp state="confirmed" land={false}>Active</Stamp> : null}
+            </span>
+          ),
+        },
+        {
+          id: 'created',
+          header: 'Created',
+          nowrap: true,
+          cell: (h) => (
+            <div className="py-0.5">
+              <Time value={h.created_at} />
+              <div className="max-w-28 truncate text-text-3" title={h.created_by}>
+                {h.created_by}
+              </div>
+            </div>
+          ),
+        },
+        { id: 'comment', header: 'Comment', cell: (h) => h.comment || <span className="text-text-3">none</span> },
+        {
+          id: 'actions',
+          header: 'Actions',
+          srOnlyHeader: true,
+          align: 'right',
+          nowrap: true,
+          width: 'w-px',
+          cell: (h) => (
+            <Button type="button" variant="outline" size="sm" onClick={() => onView(h.version)} aria-label={`View policy version ${h.version}`}>
+              View
+            </Button>
+          ),
+        },
+      ]}
+    />
   );
 }
 
 /** Any role may load a version into the editor: auditors can validate it, only admins can activate. */
-function VersionDialog({
-  version,
-  dirty,
-  onClose,
-  onLoad,
-}: {
-  version: number;
-  dirty: boolean;
-  onClose: () => void;
-  onLoad: (pv: PolicyVersion) => void;
-}) {
+function VersionDialog({ version, dirty, onClose, onLoad }: { version: number; dirty: boolean; onClose: () => void; onLoad: (pv: PolicyVersion) => void }) {
   const pv = useResource((s) => api.policyVersion(version, s), [version]);
   const data = pv.data;
   return (
@@ -467,32 +500,32 @@ function VersionDialog({
       footer={
         <>
           {data ? (
-            <button type="button" className="button" onClick={() => onLoad(data)}>
+            <Button type="button" variant="outline" onClick={() => onLoad(data)}>
               Load into editor
-            </button>
+            </Button>
           ) : null}
-          <button type="button" className="button button--primary" onClick={onClose}>
+          <Button type="button" onClick={onClose}>
             Close
-          </button>
+          </Button>
         </>
       }
     >
-      <Async resource={pv} loadingLabel="Loading the version…">
+      <Async resource={pv} loadingLabel="Loading the version…" skeleton={<PanelSkeleton lines={8} />}>
         {(v) => (
-          <>
-            <DefList
+          <div className="flex flex-col gap-3">
+            <KeyValueList
               items={[
-                ['Status', v.active ? <Badge tone="ok">active</Badge> : 'not active'],
+                ['Status', v.active ? <Stamp state="confirmed" land={false}>Active</Stamp> : <Stamp state="neutral" land={false}>Not active</Stamp>],
                 ['Created', <Time value={v.created_at} exact />],
                 ['Created by', v.created_by],
-                ['Comment', v.comment || <span className="subtle">none</span>],
+                ['Comment', v.comment || <span className="text-text-3">none</span>],
                 ['SHA-256', <Digest value={v.sha256} label="policy sha256" />],
               ]}
             />
             {dirty ? <Callout tone="warn">Loading this version replaces the unsaved text in the editor.</Callout> : null}
             <JsonView value={v.document} copyLabel="Copy policy JSON" />
-            <p className="field__hint">To roll back, load this version into the editor and activate it. It is stored as a new version.</p>
-          </>
+            <p className="text-xs text-text-3">To roll back, load this version into the editor and activate it. It is stored as a new version.</p>
+          </div>
         )}
       </Async>
     </Dialog>

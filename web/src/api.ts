@@ -320,6 +320,10 @@ export interface LastAuditVerify {
   ok: boolean;
   verified_at: string;
   problem: string | null;
+  /** The last event seq the recorded check covered (null on older records). */
+  head_seq: number | null;
+  /** The seq of the audit.verify event itself (appended right after head_seq). */
+  seq: number | null;
 }
 
 export interface Attention {
@@ -376,7 +380,7 @@ const overviewD: Decoder<Overview> = object({
   audit: object({
     head_seq: int,
     head_hash: str,
-    last_verify: maybe(object({ ok: bool, verified_at: str, problem: optText })),
+    last_verify: maybe(object({ ok: bool, verified_at: str, problem: optText, head_seq: maybe(int), seq: maybe(int) })),
   }),
   attention: array(object({ severity: str, message: str, href: optText })),
 });

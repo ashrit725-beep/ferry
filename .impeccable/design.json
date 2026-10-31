@@ -1,0 +1,470 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-10-30T00:00:00Z",
+  "title": "Design System: Ferry console",
+  "extensions": {
+    "colorMeta": {
+      "amber": {
+        "role": "primary",
+        "displayName": "Checklist Amber",
+        "canonical": "oklch(78.7% 0.147 73.0)",
+        "tonalRamp": [
+          "#1d0200",
+          "#411800",
+          "#683200",
+          "#914f00",
+          "#b67100",
+          "#d5973f",
+          "#f2bf7c",
+          "#ffe7b4"
+        ]
+      },
+      "ok": {
+        "role": "secondary",
+        "displayName": "Pass Green",
+        "canonical": "oklch(78.4% 0.149 164.7)",
+        "tonalRamp": [
+          "#001403",
+          "#003317",
+          "#00552f",
+          "#007a4b",
+          "#009d6b",
+          "#44be90",
+          "#84dfb8",
+          "#bcffe1"
+        ]
+      },
+      "bad": {
+        "role": "secondary",
+        "displayName": "Fail Red",
+        "canonical": "oklch(71.0% 0.182 22.9)",
+        "tonalRamp": [
+          "#280000",
+          "#530002",
+          "#810014",
+          "#b21c2b",
+          "#da484c",
+          "#f87876",
+          "#ffa7a2",
+          "#ffd5d0"
+        ]
+      },
+      "info": {
+        "role": "secondary",
+        "displayName": "Info Blue",
+        "canonical": "oklch(75.0% 0.133 252.0)",
+        "tonalRamp": [
+          "#000928",
+          "#002450",
+          "#00427c",
+          "#1963a9",
+          "#4085cf",
+          "#6ea9ea",
+          "#9dcdff",
+          "#ccf3ff"
+        ]
+      },
+      "rail": {
+        "role": "neutral",
+        "displayName": "Kneeboard Rail",
+        "canonical": "oklch(17.9% 0.059 264.8)",
+        "tonalRamp": [
+          "#050b19",
+          "#1b2539",
+          "#35425d",
+          "#516183",
+          "#7182a7",
+          "#95a5c6",
+          "#bcc9e5",
+          "#e4efff"
+        ]
+      },
+      "ground": {
+        "role": "neutral",
+        "displayName": "Enclave Ground",
+        "canonical": "oklch(20.8% 0.024 262.3)",
+        "tonalRamp": [
+          "#050f2b",
+          "#0d121a",
+          "#121823",
+          "#171f2c",
+          "#1e2837",
+          "#263143",
+          "#9099aa",
+          "#e8e6de"
+        ],
+        "note": "Ramp is the shipped surface ladder: rail, inset, ground, panel, raised, hover, text-3, bone."
+      },
+      "bone": {
+        "role": "neutral",
+        "displayName": "Bone",
+        "canonical": "oklch(92.4% 0.011 95.2)",
+        "tonalRamp": [
+          "#0c0b08",
+          "#262521",
+          "#43423c",
+          "#63615a",
+          "#84827b",
+          "#a7a59f",
+          "#cac9c4",
+          "#efeeea"
+        ]
+      },
+      "inset": {
+        "role": "neutral",
+        "displayName": "Well"
+      },
+      "panel": {
+        "role": "neutral",
+        "displayName": "Panel"
+      },
+      "raised": {
+        "role": "neutral",
+        "displayName": "Raised"
+      },
+      "hover": {
+        "role": "neutral",
+        "displayName": "Hover"
+      },
+      "text-2": {
+        "role": "neutral",
+        "displayName": "Secondary Text"
+      },
+      "text-3": {
+        "role": "neutral",
+        "displayName": "Tertiary Text"
+      },
+      "hairline": {
+        "role": "neutral",
+        "displayName": "Hairline"
+      },
+      "leader": {
+        "role": "neutral",
+        "displayName": "Leader"
+      },
+      "line-control": {
+        "role": "neutral",
+        "displayName": "Control Line"
+      },
+      "neutral": {
+        "role": "neutral",
+        "displayName": "Retired Grey"
+      },
+      "rail-active": {
+        "role": "neutral",
+        "displayName": "Rail Active"
+      },
+      "amber-subtle": {
+        "role": "secondary",
+        "displayName": "Amber Well"
+      },
+      "ok-subtle": {
+        "role": "secondary",
+        "displayName": "Green Well"
+      },
+      "bad-subtle": {
+        "role": "secondary",
+        "displayName": "Red Well"
+      },
+      "info-subtle": {
+        "role": "secondary",
+        "displayName": "Blue Well"
+      },
+      "neutral-subtle": {
+        "role": "secondary",
+        "displayName": "Grey Well"
+      }
+    },
+    "typographyMeta": {
+      "display": {
+        "displayName": "Display",
+        "purpose": "Lifecycle band stage counts only."
+      },
+      "headline": {
+        "displayName": "Page title",
+        "purpose": "The single h1 per page; widened Archivo."
+      },
+      "readout": {
+        "displayName": "Readout",
+        "purpose": "Live monospace figures."
+      },
+      "title": {
+        "displayName": "Panel title",
+        "purpose": "Section panel headings."
+      },
+      "body": {
+        "displayName": "UI",
+        "purpose": "Default 13px UI text."
+      },
+      "body-prose": {
+        "displayName": "Prose",
+        "purpose": "Page descriptions, max 72ch."
+      },
+      "table": {
+        "displayName": "Table",
+        "purpose": "Tables, checklist responses, captions."
+      },
+      "label-caps": {
+        "displayName": "Section label",
+        "purpose": "Checklist group labels, lifecycle group captions, rail Gateway label."
+      },
+      "stamp": {
+        "displayName": "Stamp",
+        "purpose": "Stamp words and small row tags."
+      },
+      "stage": {
+        "displayName": "Stage",
+        "purpose": "Lifecycle stage names; 12px at 0.12em below xl, 14px at 0.16em from xl."
+      },
+      "mono": {
+        "displayName": "Mono",
+        "purpose": "Hashes, ids, paths, model names, commands, JSON."
+      }
+    },
+    "shadows": [
+      {
+        "name": "float",
+        "value": "0 12px 32px -12px rgb(2 6 18 / 0.75)",
+        "purpose": "Dialogs, command palette, toasts only."
+      },
+      {
+        "name": "selected-edge",
+        "value": "inset 1px 0 0 0 var(--amber)",
+        "purpose": "Selected table row; decisive policy rule."
+      },
+      {
+        "name": "pinned-edge",
+        "value": "inset 1px 0 0 0 var(--hairline), -8px 0 8px -8px var(--ground)",
+        "purpose": "Pinned actions column, only while its table overflows sideways."
+      }
+    ],
+    "motion": [
+      {
+        "name": "dur-fast",
+        "value": "125ms",
+        "purpose": "Default transition duration (colour, hover)."
+      },
+      {
+        "name": "dur-base",
+        "value": "150ms",
+        "purpose": "State change, enter, exit, press."
+      },
+      {
+        "name": "dur-pop",
+        "value": "200ms",
+        "purpose": "Popover, dialog, toast content; table row reorder."
+      },
+      {
+        "name": "dur-draw",
+        "value": "240ms",
+        "purpose": "Checklist leader draw; status-mark glyph draw."
+      },
+      {
+        "name": "dur-stamp",
+        "value": "180ms",
+        "purpose": "Stamp landing, 0.92 to 1 scale."
+      },
+      {
+        "name": "dur-sheet",
+        "value": "300ms",
+        "purpose": "Mobile rail sheet."
+      },
+      {
+        "name": "stagger",
+        "value": "30ms",
+        "purpose": "List entrance stagger."
+      },
+      {
+        "name": "ease-out",
+        "value": "cubic-bezier(0.23, 1, 0.32, 1)",
+        "purpose": "Default exponential ease-out for all state motion."
+      },
+      {
+        "name": "ease-in-out",
+        "value": "cubic-bezier(0.77, 0, 0.175, 1)",
+        "purpose": "Status-mark breathe."
+      },
+      {
+        "name": "ease-drawer",
+        "value": "cubic-bezier(0.32, 0.72, 0, 1)",
+        "purpose": "Sheet and drawer."
+      },
+      {
+        "name": "focus-ring",
+        "value": "2px solid var(--amber), offset 2px (4px on h1 and main)",
+        "purpose": "The one keyboard focus treatment."
+      },
+      {
+        "name": "reduced-motion",
+        "value": "transforms and loops stop; opacity and colour feedback at 150ms stay; spinners keep turning",
+        "purpose": "prefers-reduced-motion policy."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "sm",
+        "value": "640px"
+      },
+      {
+        "name": "md",
+        "value": "768px"
+      },
+      {
+        "name": "lg",
+        "value": "1024px"
+      },
+      {
+        "name": "xl",
+        "value": "1280px"
+      },
+      {
+        "name": "2xl",
+        "value": "1536px"
+      },
+      {
+        "name": "main-max",
+        "value": "1440px"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "The ordinary primary action: filled bone. Amber is not used here.",
+      "html": "<button class=\"ds-btn-primary\">Refresh</button>",
+      "css": ":host{--amber:#f2a93b;--amber-hover:#f7ba5c;--amber-press:#d98e1f;--amber-subtle:#2a2417;--on-amber:#1a1203;--rail:#050f2b;--rail-hover:#0a1a44;--rail-active:#112459;--rail-text:#bfc9de;--inset:#0d121a;--ground:#121823;--panel:#171f2c;--raised:#1e2837;--hover:#263143;--bone:#e8e6de;--text-2:#b3b9c6;--text-3:#9099aa;--hairline:#263044;--leader:#4a566b;--line-control:#6b7a92;--ok:#3dd6a0;--ok-subtle:#0f2f27;--bad:#ff6a6a;--bad-subtle:#351a1f;--on-bad:#1b0a0e;--info:#6cb2ff;--neutral:#9ba5b6;--neutral-subtle:#232b39;}.ds-btn-primary{display:inline-flex;align-items:center;gap:6px;height:32px;padding:0 10px;border:1px solid transparent;border-radius:4px;font:500 13px/20px 'Archivo Variable', system-ui, sans-serif;cursor:pointer;transition:background-color 125ms ease,transform 125ms ease;background:var(--bone);color:var(--ground);}.ds-btn-primary:hover{background:rgb(232 230 222 / .85);}.ds-btn-primary:active{background:rgb(232 230 222 / .75);transform:translateY(1px);}.ds-btn-primary:focus-visible{outline:2px solid #f2a93b;outline-offset:2px;}"
+    },
+    {
+      "name": "Attention Button",
+      "kind": "button",
+      "refersTo": "button-attention",
+      "description": "The primary action on the first pending checklist line.",
+      "html": "<button class=\"ds-btn-attention\">Verify 1 bundle</button>",
+      "css": ":host{--amber:#f2a93b;--amber-hover:#f7ba5c;--amber-press:#d98e1f;--amber-subtle:#2a2417;--on-amber:#1a1203;--rail:#050f2b;--rail-hover:#0a1a44;--rail-active:#112459;--rail-text:#bfc9de;--inset:#0d121a;--ground:#121823;--panel:#171f2c;--raised:#1e2837;--hover:#263143;--bone:#e8e6de;--text-2:#b3b9c6;--text-3:#9099aa;--hairline:#263044;--leader:#4a566b;--line-control:#6b7a92;--ok:#3dd6a0;--ok-subtle:#0f2f27;--bad:#ff6a6a;--bad-subtle:#351a1f;--on-bad:#1b0a0e;--info:#6cb2ff;--neutral:#9ba5b6;--neutral-subtle:#232b39;}.ds-btn-attention{display:inline-flex;align-items:center;gap:6px;height:32px;padding:0 10px;border:1px solid transparent;border-radius:4px;font:500 13px/20px 'Archivo Variable', system-ui, sans-serif;cursor:pointer;transition:background-color 125ms ease,transform 125ms ease;background:var(--amber);color:var(--on-amber);}.ds-btn-attention:hover{background:var(--amber-hover);}.ds-btn-attention:active{background:var(--amber-press);transform:translateY(1px);}.ds-btn-attention:focus-visible{outline:2px solid #f2a93b;outline-offset:2px;}"
+    },
+    {
+      "name": "Danger Button",
+      "kind": "button",
+      "refersTo": "button-danger",
+      "description": "Confirm button of a destructive dialog only; a solid fill, never a tint.",
+      "html": "<button class=\"ds-btn-danger\">Delete route</button>",
+      "css": ":host{--amber:#f2a93b;--amber-hover:#f7ba5c;--amber-press:#d98e1f;--amber-subtle:#2a2417;--on-amber:#1a1203;--rail:#050f2b;--rail-hover:#0a1a44;--rail-active:#112459;--rail-text:#bfc9de;--inset:#0d121a;--ground:#121823;--panel:#171f2c;--raised:#1e2837;--hover:#263143;--bone:#e8e6de;--text-2:#b3b9c6;--text-3:#9099aa;--hairline:#263044;--leader:#4a566b;--line-control:#6b7a92;--ok:#3dd6a0;--ok-subtle:#0f2f27;--bad:#ff6a6a;--bad-subtle:#351a1f;--on-bad:#1b0a0e;--info:#6cb2ff;--neutral:#9ba5b6;--neutral-subtle:#232b39;}.ds-btn-danger{display:inline-flex;align-items:center;gap:6px;height:32px;padding:0 10px;border:1px solid transparent;border-radius:4px;font:500 13px/20px 'Archivo Variable', system-ui, sans-serif;cursor:pointer;transition:background-color 125ms ease,transform 125ms ease;background:var(--bad);color:var(--on-bad);}.ds-btn-danger:hover{background:rgb(255 106 106 / .9);}.ds-btn-danger:focus-visible{outline:2px solid #f2a93b;outline-offset:2px;}"
+    },
+    {
+      "name": "Ghost Button",
+      "kind": "button",
+      "refersTo": "button-ghost-hover",
+      "description": "Tertiary actions and toolbar controls.",
+      "html": "<button class=\"ds-btn-ghost\">Cancel</button>",
+      "css": ":host{--amber:#f2a93b;--amber-hover:#f7ba5c;--amber-press:#d98e1f;--amber-subtle:#2a2417;--on-amber:#1a1203;--rail:#050f2b;--rail-hover:#0a1a44;--rail-active:#112459;--rail-text:#bfc9de;--inset:#0d121a;--ground:#121823;--panel:#171f2c;--raised:#1e2837;--hover:#263143;--bone:#e8e6de;--text-2:#b3b9c6;--text-3:#9099aa;--hairline:#263044;--leader:#4a566b;--line-control:#6b7a92;--ok:#3dd6a0;--ok-subtle:#0f2f27;--bad:#ff6a6a;--bad-subtle:#351a1f;--on-bad:#1b0a0e;--info:#6cb2ff;--neutral:#9ba5b6;--neutral-subtle:#232b39;}.ds-btn-ghost{display:inline-flex;align-items:center;gap:6px;height:32px;padding:0 10px;border:1px solid transparent;border-radius:4px;font:500 13px/20px 'Archivo Variable', system-ui, sans-serif;cursor:pointer;transition:background-color 125ms ease,transform 125ms ease;background:transparent;color:var(--bone);}.ds-btn-ghost:hover{background:rgb(38 49 67 / .5);}.ds-btn-ghost:focus-visible{outline:2px solid #f2a93b;outline-offset:2px;}"
+    },
+    {
+      "name": "Text Field",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "32px field on a control-line wash; amber border and ring on focus.",
+      "html": "<input class=\"ds-input\" placeholder=\"Model name\" />",
+      "css": ":host{--amber:#f2a93b;--amber-hover:#f7ba5c;--amber-press:#d98e1f;--amber-subtle:#2a2417;--on-amber:#1a1203;--rail:#050f2b;--rail-hover:#0a1a44;--rail-active:#112459;--rail-text:#bfc9de;--inset:#0d121a;--ground:#121823;--panel:#171f2c;--raised:#1e2837;--hover:#263143;--bone:#e8e6de;--text-2:#b3b9c6;--text-3:#9099aa;--hairline:#263044;--leader:#4a566b;--line-control:#6b7a92;--ok:#3dd6a0;--ok-subtle:#0f2f27;--bad:#ff6a6a;--bad-subtle:#351a1f;--on-bad:#1b0a0e;--info:#6cb2ff;--neutral:#9ba5b6;--neutral-subtle:#232b39;}.ds-input{height:32px;width:240px;padding:4px 10px;border:1px solid var(--line-control);border-radius:4px;background:rgb(107 122 146 / .3);color:var(--bone);font:400 13px/20px 'Archivo Variable', system-ui, sans-serif;transition:border-color 125ms ease;}.ds-input::placeholder{color:var(--text-3);}.ds-input:focus-visible{border-color:var(--amber);outline:2px solid #f2a93b;outline-offset:2px;}"
+    },
+    {
+      "name": "Stamps",
+      "kind": "chip",
+      "refersTo": "stamp-confirmed",
+      "description": "Stamped responses: glyph plus caps word plus state hue.",
+      "html": "<span class=\"ds-stamp ds-ok\"><svg viewBox=\"0 0 24 24\" width=\"12\" height=\"12\" aria-hidden=\"true\"><circle cx=\"12\" cy=\"12\" r=\"9\" fill=\"currentColor\" fill-opacity=\"0.12\"/><circle cx=\"12\" cy=\"12\" r=\"9\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"/><path d=\"M7.5 12.25 10.5 15.25 16.75 8.75\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg><span>Verified</span></span> <span class=\"ds-stamp ds-pend\"><svg viewBox=\"0 0 24 24\" width=\"12\" height=\"12\" aria-hidden=\"true\"><circle cx=\"12\" cy=\"12\" r=\"9\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-dasharray=\"3.53 3.53\" opacity=\"0.6\"/></svg><span>Pending</span></span> <span class=\"ds-stamp ds-bad\"><svg viewBox=\"0 0 24 24\" width=\"12\" height=\"12\" aria-hidden=\"true\"><circle cx=\"12\" cy=\"12\" r=\"9\" fill=\"currentColor\" fill-opacity=\"0.12\"/><circle cx=\"12\" cy=\"12\" r=\"9\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"/><path d=\"M8.5 8.5 15.5 15.5M15.5 8.5 8.5 15.5\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/></svg><span>Failed</span></span> <span class=\"ds-stamp ds-neu\"><svg viewBox=\"0 0 24 24\" width=\"12\" height=\"12\" aria-hidden=\"true\"><circle cx=\"12\" cy=\"12\" r=\"9\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"/><path d=\"M8 12h8\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/></svg><span>Revoked</span></span>",
+      "css": ":host{--amber:#f2a93b;--amber-hover:#f7ba5c;--amber-press:#d98e1f;--amber-subtle:#2a2417;--on-amber:#1a1203;--rail:#050f2b;--rail-hover:#0a1a44;--rail-active:#112459;--rail-text:#bfc9de;--inset:#0d121a;--ground:#121823;--panel:#171f2c;--raised:#1e2837;--hover:#263143;--bone:#e8e6de;--text-2:#b3b9c6;--text-3:#9099aa;--hairline:#263044;--leader:#4a566b;--line-control:#6b7a92;--ok:#3dd6a0;--ok-subtle:#0f2f27;--bad:#ff6a6a;--bad-subtle:#351a1f;--on-bad:#1b0a0e;--info:#6cb2ff;--neutral:#9ba5b6;--neutral-subtle:#232b39;}.ds-stamp{display:inline-flex;align-items:center;gap:4px;height:20px;padding:0 6px;border:1px solid;border-radius:3px;font:500 11px/16px 'Archivo Variable', system-ui, sans-serif;letter-spacing:0.06em;text-transform:uppercase;white-space:nowrap;}.ds-ok{color:var(--ok);background:var(--ok-subtle);border-color:rgb(61 214 160 / .4);}.ds-pend{color:var(--amber);background:var(--amber-subtle);border-color:rgb(242 169 59 / .4);}.ds-bad{color:var(--bad);background:var(--bad-subtle);border-color:rgb(255 106 106 / .4);}.ds-neu{color:var(--neutral);background:var(--neutral-subtle);border-color:rgb(155 165 182 / .4);}"
+    },
+    {
+      "name": "Checklist",
+      "kind": "custom",
+      "refersTo": "checklist-line",
+      "description": "Signature: challenge, dotted leader, evidence, stamp. Attention lines first.",
+      "html": "<section class=\"ds-cl\"><div class=\"ds-cl-head\"><h3>Enclave readiness</h3><span>7 of 8 confirmed</span></div><ol><li><a href=\"#\">Inbox</a><span class=\"ds-leader\"></span><span class=\"ds-val\">1 waiting</span><span class=\"ds-stamp ds-pend\"><svg viewBox=\"0 0 24 24\" width=\"12\" height=\"12\" aria-hidden=\"true\"><circle cx=\"12\" cy=\"12\" r=\"9\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-dasharray=\"3.53 3.53\" opacity=\"0.6\"/></svg><span>Pending</span></span><button class=\"ds-act\">Verify 1 bundle</button></li><li><a href=\"#\">Trusted signing keys</a><span class=\"ds-leader\"></span><span class=\"ds-val\">2 keys</span><span class=\"ds-stamp ds-ok\"><svg viewBox=\"0 0 24 24\" width=\"12\" height=\"12\" aria-hidden=\"true\"><circle cx=\"12\" cy=\"12\" r=\"9\" fill=\"currentColor\" fill-opacity=\"0.12\"/><circle cx=\"12\" cy=\"12\" r=\"9\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"/><path d=\"M7.5 12.25 10.5 15.25 16.75 8.75\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg><span>Trusted</span></span></li><li><a href=\"#\">Audit chain</a><span class=\"ds-leader\"></span><span class=\"ds-val\"><code>a968b4dd34f1…8a79c2</code></span><span class=\"ds-stamp ds-ok\"><svg viewBox=\"0 0 24 24\" width=\"12\" height=\"12\" aria-hidden=\"true\"><circle cx=\"12\" cy=\"12\" r=\"9\" fill=\"currentColor\" fill-opacity=\"0.12\"/><circle cx=\"12\" cy=\"12\" r=\"9\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"/><path d=\"M7.5 12.25 10.5 15.25 16.75 8.75\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg><span>Intact</span></span></li></ol></section>",
+      "css": ":host{--amber:#f2a93b;--amber-hover:#f7ba5c;--amber-press:#d98e1f;--amber-subtle:#2a2417;--on-amber:#1a1203;--rail:#050f2b;--rail-hover:#0a1a44;--rail-active:#112459;--rail-text:#bfc9de;--inset:#0d121a;--ground:#121823;--panel:#171f2c;--raised:#1e2837;--hover:#263143;--bone:#e8e6de;--text-2:#b3b9c6;--text-3:#9099aa;--hairline:#263044;--leader:#4a566b;--line-control:#6b7a92;--ok:#3dd6a0;--ok-subtle:#0f2f27;--bad:#ff6a6a;--bad-subtle:#351a1f;--on-bad:#1b0a0e;--info:#6cb2ff;--neutral:#9ba5b6;--neutral-subtle:#232b39;}.ds-cl{width:560px;background:var(--panel);padding:12px;border-radius:4px;box-shadow:0 0 0 1px var(--hairline);font-family:'Archivo Variable', system-ui, sans-serif;}.ds-cl-head{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px;}.ds-cl-head h3{margin:0;font:500 11px/16px 'Archivo Variable', system-ui, sans-serif;letter-spacing:.14em;text-transform:uppercase;color:var(--text-3);}.ds-cl-head span{font-size:11px;color:var(--text-3);}.ds-cl ol{list-style:none;margin:0;padding:0;}.ds-cl li{display:flex;align-items:center;gap:8px;min-height:32px;border-top:1px solid var(--hairline);}.ds-cl li:first-child{border-top:0;}.ds-cl li:hover{background:rgb(38 49 67 / .4);}.ds-cl a{color:var(--bone);font-size:13px;text-decoration:none;border-radius:3px;}.ds-cl a:hover{text-decoration:underline;text-underline-offset:3px;}.ds-cl a:focus-visible,.ds-act:focus-visible{outline:2px solid #f2a93b;outline-offset:2px;}.ds-leader{flex:1;min-width:16px;align-self:flex-end;margin-bottom:10px;border-bottom:1.5px dotted var(--leader);transform-origin:left;animation:ds-draw 240ms cubic-bezier(.23,1,.32,1);}.ds-val{font-size:12px;color:var(--text-2);font-variant-numeric:tabular-nums;}.ds-val code{font-family:'Azeret Mono', ui-monospace, monospace;}.ds-stamp{display:inline-flex;align-items:center;gap:4px;height:20px;padding:0 6px;border:1px solid;border-radius:3px;font:500 11px/16px 'Archivo Variable', system-ui, sans-serif;letter-spacing:0.06em;text-transform:uppercase;white-space:nowrap;animation:ds-land 180ms cubic-bezier(.23,1,.32,1);}.ds-ok{color:var(--ok);background:var(--ok-subtle);border-color:rgb(61 214 160 / .4);}.ds-pend{color:var(--amber);background:var(--amber-subtle);border-color:rgb(242 169 59 / .4);}.ds-act{height:28px;padding:0 10px;border:0;border-radius:4px;background:var(--amber);color:var(--on-amber);font:500 13px/20px 'Archivo Variable', system-ui, sans-serif;cursor:pointer;}.ds-act:hover{background:var(--amber-hover);}@keyframes ds-draw{from{transform:scaleX(0)}to{transform:scaleX(1)}}@keyframes ds-land{from{transform:scale(.92);opacity:0}to{transform:scale(1);opacity:1}}@media (prefers-reduced-motion:reduce){.ds-leader,.ds-stamp{animation:none}}"
+    },
+    {
+      "name": "Section Panel",
+      "kind": "card",
+      "refersTo": "section-panel",
+      "description": "In-flow panel: flat, hairline ring, titled header with an Open link.",
+      "html": "<section class=\"ds-panel\"><header><div><h2>Audit log</h2><p>Hash-chained record of every action.</p></div><a href=\"#\">Open audit log <svg viewBox=\"0 0 24 24\" width=\"14\" height=\"14\" aria-hidden=\"true\"><path d=\"M5 12h14M12 5l7 7-7 7\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg></a></header><div class=\"ds-body\">Latest event <code>#76</code></div></section>",
+      "css": ":host{--amber:#f2a93b;--amber-hover:#f7ba5c;--amber-press:#d98e1f;--amber-subtle:#2a2417;--on-amber:#1a1203;--rail:#050f2b;--rail-hover:#0a1a44;--rail-active:#112459;--rail-text:#bfc9de;--inset:#0d121a;--ground:#121823;--panel:#171f2c;--raised:#1e2837;--hover:#263143;--bone:#e8e6de;--text-2:#b3b9c6;--text-3:#9099aa;--hairline:#263044;--leader:#4a566b;--line-control:#6b7a92;--ok:#3dd6a0;--ok-subtle:#0f2f27;--bad:#ff6a6a;--bad-subtle:#351a1f;--on-bad:#1b0a0e;--info:#6cb2ff;--neutral:#9ba5b6;--neutral-subtle:#232b39;}.ds-panel{width:420px;background:var(--panel);color:var(--bone);border-radius:4px;box-shadow:0 0 0 1px var(--hairline);overflow:hidden;font:400 13px/20px 'Archivo Variable', system-ui, sans-serif;}.ds-panel header{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:40px;padding:8px 12px;border-bottom:1px solid var(--hairline);}.ds-panel h2{margin:0;font:600 14px/20px 'Archivo Variable', system-ui, sans-serif;}.ds-panel p{margin:0;font-size:12px;color:var(--text-2);}.ds-panel a{display:inline-flex;align-items:center;gap:4px;height:28px;padding:0 6px;border-radius:3px;font-size:12px;color:var(--text-2);text-decoration:none;}.ds-panel a:hover{background:var(--hover);color:var(--bone);}.ds-panel a:focus-visible{outline:2px solid #f2a93b;outline-offset:2px;}.ds-body{padding:12px;}.ds-body code{font-family:'Azeret Mono', ui-monospace, monospace;}"
+    },
+    {
+      "name": "Rail Navigation",
+      "kind": "nav",
+      "refersTo": "nav-item-active",
+      "description": "Deep-blue rail; the current page carries a 2px amber bar and an amber icon.",
+      "html": "<nav class=\"ds-rail\"><a class=\"on\" href=\"#\" aria-current=\"page\"><svg viewBox=\"0 0 24 24\" width=\"16\" height=\"16\" aria-hidden=\"true\"><rect x=\"3\" y=\"3\" width=\"7\" height=\"7\" rx=\"1\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.75\"/><rect x=\"14\" y=\"3\" width=\"7\" height=\"7\" rx=\"1\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.75\"/><rect x=\"3\" y=\"14\" width=\"7\" height=\"7\" rx=\"1\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.75\"/><rect x=\"14\" y=\"14\" width=\"7\" height=\"7\" rx=\"1\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.75\"/></svg>Overview</a><a href=\"#\"><svg viewBox=\"0 0 24 24\" width=\"16\" height=\"16\" aria-hidden=\"true\"><path d=\"M21 8 12 3 3 8v8l9 5 9-5z\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.75\" stroke-linejoin=\"round\"/></svg>Bundles</a></nav>",
+      "css": ":host{--amber:#f2a93b;--amber-hover:#f7ba5c;--amber-press:#d98e1f;--amber-subtle:#2a2417;--on-amber:#1a1203;--rail:#050f2b;--rail-hover:#0a1a44;--rail-active:#112459;--rail-text:#bfc9de;--inset:#0d121a;--ground:#121823;--panel:#171f2c;--raised:#1e2837;--hover:#263143;--bone:#e8e6de;--text-2:#b3b9c6;--text-3:#9099aa;--hairline:#263044;--leader:#4a566b;--line-control:#6b7a92;--ok:#3dd6a0;--ok-subtle:#0f2f27;--bad:#ff6a6a;--bad-subtle:#351a1f;--on-bad:#1b0a0e;--info:#6cb2ff;--neutral:#9ba5b6;--neutral-subtle:#232b39;}.ds-rail{width:232px;background:var(--rail);padding:8px 0;font:400 13px/20px 'Archivo Variable', system-ui, sans-serif;}.ds-rail a{position:relative;display:flex;align-items:center;gap:10px;height:40px;padding:0 16px;color:var(--rail-text);text-decoration:none;}.ds-rail a:hover{background:var(--rail-hover);color:var(--bone);}.ds-rail a:focus-visible{outline:2px solid #f2a93b;outline-offset:2px;outline-offset:-2px;}.ds-rail a.on{background:var(--rail-active);color:var(--bone);font-weight:500;}.ds-rail a.on svg{color:var(--amber);}.ds-rail a.on::before{content:'';position:absolute;top:8px;bottom:8px;left:0;width:2px;background:var(--amber);}"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Pre-Flight Checklist",
+    "overview": "The console reads like a kneeboard checklist in a dark cockpit: every fact is a challenge with a dotted leader and a stamped, evidenced response, read top to bottom with attention items first. A near-black blue ground, a deeper-blue rail, bone type on hairline-bordered flat panels. Amber is the single attention voice; green, red and blue only carry state, always beside a glyph and a word. Density is operational: 13px UI, 12px tables, 32px rows, 4/8 spacing, 4px corners. Motion confirms state; the lifecycle beam crossing the air gap is the shell's one ambient moment.",
+    "keyCharacteristics": [
+      "Challenge-and-response lines with dotted leaders and stamps",
+      "One dark scene",
+      "Amber means a human is needed here",
+      "Archivo for UI, Azeret Mono for machine strings",
+      "Flat panels on a lightness ladder; shadow only on floating layers",
+      "Motion confirms state"
+    ],
+    "rules": [
+      {
+        "name": "The One Voice Rule",
+        "body": "Amber is the only attention colour: pending, needs attention, focus, current page, selection. A non-pending primary action is bone.",
+        "section": "colors"
+      },
+      {
+        "name": "The State Only Rule",
+        "body": "Green, red and blue appear only where they carry a state, always beside a glyph and a word.",
+        "section": "colors"
+      },
+      {
+        "name": "The Machine Wrote It Rule",
+        "body": "Machine strings are Azeret Mono; anything read as a sentence, time or summary is Archivo with tabular numerals.",
+        "section": "typography"
+      },
+      {
+        "name": "The Caps Are Headings Rule",
+        "body": "Wide-tracked caps label a checklist group, stage or stamp; never an eyebrow above a page or panel title.",
+        "section": "typography"
+      },
+      {
+        "name": "The Flat Panel Rule",
+        "body": "In-flow surfaces are panel plus hairline ring; shadow means the layer floats.",
+        "section": "elevation"
+      },
+      {
+        "name": "The 32 Rule",
+        "body": "Rows, controls and header cells are 32px tall.",
+        "section": "layout"
+      },
+      {
+        "name": "The Square Shoulder Rule",
+        "body": "No in-flow corner exceeds 4px; no pills.",
+        "section": "shapes"
+      }
+    ],
+    "dos": [
+      "Do express every status as a stamp: glyph, word and state hue together.",
+      "Do put the page's primary action on the first pending checklist line, in the attention button.",
+      "Do set machine strings in Azeret Mono and human strings in Archivo with tabular numerals.",
+      "Do keep in-flow surfaces flat and reserve the float shadow for dialogs, the palette and toasts.",
+      "Do keep state transitions at 125 to 250ms on the exponential ease-out.",
+      "Do print revoked and retired items in neutral grey."
+    ],
+    "donts": [
+      "Don't use amber for decoration, emphasis or a non-pending primary action.",
+      "Don't use green, red or blue as accents or brand colour.",
+      "Don't add a row of count tiles that repeats the checklist or lifecycle band.",
+      "Don't stack a caps label above a page or panel title as an eyebrow.",
+      "Don't round in-flow elements past 4px or use pills.",
+      "Don't add a second ambient animation inside the shell.",
+      "Don't convey state by colour alone."
+    ]
+  }
+}

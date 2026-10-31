@@ -4,7 +4,7 @@
  * future value still reads correctly (it falls back to neutral).
  */
 
-import type { ApiKeySummary } from './api.ts';
+import type { ApiKeySummary, LastAuditVerify } from './api.ts';
 import { isPast } from './format.ts';
 
 export type Tone = 'ok' | 'warn' | 'bad' | 'info' | 'neutral';
@@ -97,4 +97,29 @@ export function isAdminRole(role: string | null | undefined): boolean {
  */
 export function isJobActive(state: string | null | undefined): boolean {
   return state === 'queued' || state === 'running';
+}
+
+/* ------------------------------------------------------------------ audit chain coverage */
+
+/**
+ * What the last recorded chain check says about the log as it stands now. A
+ * check only vouches for the events it recomputed: anything appended after the
+ * check's own audit.verify event is not covered until the chain is verified again.
+ */
+export type ChainCoverage =
+  | { kind: 'never' }
+  | { kind: 'failed'; last: LastAuditVerify }
+  | { kind: 'current'; last: LastAuditVerify; checkedTo: number | null }
+  | { kind: 'stale'; last: LastAuditVerify; checkedTo: number | null; since: number | null };
+
+export function chainCoverage(audit: { head_seq: number; last_verify: LastAuditVerify | null }): ChainCoverage {
+  const last = audit.last_verify;
+  if (last === null) return { kind: 'never' };
+  if (!last.ok) return { kind: 'failed', last };
+  const checkedTo = last.head_seq ?? (last.seq !== null ? last.seq - 1 : null);
+  // Without the check's own seq the coverage cannot be shown, so it is not claimed.
+  if (last.seq === null) return { kind: 'stale', last, checkedTo, since: null };
+  if (audit.head_seq <= last.seq) return { kind: 'current', last, checkedTo };
+  // Counted from the last covered event, so the check's own record (not covered by it) is one of them.
+  return { kind: 'stale', last, checkedTo, since: audit.head_seq - (checkedTo ?? last.seq) };
 }

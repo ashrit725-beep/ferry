@@ -1,0 +1,479 @@
+/*
+ * Ferry console design system: one dark scene (the enclave's pre-flight
+ * checklist). Tokens are defined once on :root and mirrored on .dark so the
+ * vendored shadcn components, which use the `dark:` variant, resolve the same
+ * values. Every colour in the console traces to a token here; ratios are
+ * recorded in scratchpad/brief/system-notes.md.
+ */
+
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "sonner/dist/styles.css";
+
+/*
+ * Fonts, bundled from @fontsource as files (font-src 'self'). Only the latin
+ * and latin-ext subsets are declared, woff2 only, so the build ships nothing
+ * the console never draws. Archivo (variable weight and width axes, SIL OFL 1.1; page
+ * titles and the lifecycle band use the width axis) for the UI; Azeret
+ * Mono (SIL OFL 1.1, 400 and 500) for hashes, ids, paths, commands, JSON and
+ * table counters: its punctuation sits centred in the cell, so versions,
+ * addresses and times read as written.
+ */
+@font-face {
+  font-family: 'Archivo Variable';
+  font-style: normal;
+  font-weight: 100 900;
+  font-stretch: 62% 125%;
+  font-display: swap;
+  src: url('@fontsource-variable/archivo/files/archivo-latin-ext-wdth-normal.woff2') format('woff2-variations');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF,
+    U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: 'Archivo Variable';
+  font-style: normal;
+  font-weight: 100 900;
+  font-stretch: 62% 125%;
+  font-display: swap;
+  src: url('@fontsource-variable/archivo/files/archivo-latin-wdth-normal.woff2') format('woff2-variations');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329,
+    U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'Azeret Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('@fontsource/azeret-mono/files/azeret-mono-latin-ext-400-normal.woff2') format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF,
+    U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: 'Azeret Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('@fontsource/azeret-mono/files/azeret-mono-latin-400-normal.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329,
+    U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'Azeret Mono';
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url('@fontsource/azeret-mono/files/azeret-mono-latin-ext-500-normal.woff2') format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF,
+    U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: 'Azeret Mono';
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url('@fontsource/azeret-mono/files/azeret-mono-latin-500-normal.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329,
+    U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  /* type */
+  --font-sans: 'Archivo Variable', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-heading: var(--font-sans);
+  --font-mono: 'Azeret Mono', ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+  /* scale: 11 meta, 12 tables and captions, 13 UI, 14 body prose, 16 panel titles, 20 page titles, 28 readouts */
+  --text-2xs: 0.6875rem;
+  --text-2xs--line-height: 1rem;
+  --text-xs: 0.75rem;
+  --text-xs--line-height: 1rem;
+  --text-sm: 0.8125rem;
+  --text-sm--line-height: 1.25rem;
+  --text-base: 0.875rem;
+  --text-base--line-height: 1.25rem;
+  --text-lg: 1rem;
+  --text-lg--line-height: 1.5rem;
+  --text-xl: 1.25rem;
+  --text-xl--line-height: 1.75rem;
+  --text-2xl: 1.75rem;
+  --text-2xl--line-height: 2rem;
+
+  /* shadcn surface mapping */
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+
+  /* world tokens as utilities: text-amber, bg-rail, border-leader, bg-ok-subtle ... */
+  --color-ground: var(--ground);
+  --color-inset: var(--inset);
+  --color-panel: var(--panel);
+  --color-raised: var(--raised);
+  --color-hover: var(--hover);
+  --color-bone: var(--bone);
+  --color-text-2: var(--text-2);
+  --color-text-3: var(--text-3);
+  --color-hairline: var(--hairline);
+  --color-leader: var(--leader);
+  --color-line-control: var(--line-control);
+  --color-rail: var(--rail);
+  --color-rail-hover: var(--rail-hover);
+  --color-rail-active: var(--rail-active);
+  --color-rail-text: var(--rail-text);
+  --color-rail-muted: var(--rail-muted);
+  --color-amber: var(--amber);
+  --color-amber-hover: var(--amber-hover);
+  --color-amber-press: var(--amber-press);
+  --color-amber-subtle: var(--amber-subtle);
+  --color-on-amber: var(--on-amber);
+  --color-ok: var(--ok);
+  --color-ok-subtle: var(--ok-subtle);
+  --color-warn: var(--warn);
+  --color-warn-subtle: var(--warn-subtle);
+  --color-bad: var(--bad);
+  --color-bad-subtle: var(--bad-subtle);
+  --color-on-bad: var(--on-bad);
+  --color-info: var(--info);
+  --color-info-subtle: var(--info-subtle);
+  --color-neutral: var(--neutral);
+  --color-neutral-subtle: var(--neutral-subtle);
+  --color-scrim: var(--scrim);
+
+  /* radius: one scale, 4 px at rest (rounded-lg = --radius) */
+  --radius-sm: calc(var(--radius) * 0.75);
+  --radius-md: var(--radius);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.5);
+  --radius-2xl: calc(var(--radius) * 2);
+  --radius-3xl: calc(var(--radius) * 2);
+  --radius-4xl: calc(var(--radius) * 2);
+
+  /* motion: ease-out and ease-in-out utilities take the strong curves */
+  --ease-out: var(--ease-out-curve);
+  --ease-in-out: var(--ease-in-out-curve);
+  --ease-drawer: var(--ease-drawer-curve);
+  --default-transition-duration: var(--dur-fast);
+  --default-transition-timing-function: ease;
+
+  /* shadows: floating layers only */
+  --shadow-float: 0 12px 32px -12px rgb(2 6 18 / 0.75);
+
+  /* vendored effect keyframes live here, never in a runtime <style> */
+  --animate-dot-drift: dot-drift 90s linear infinite;
+  --animate-mark-breathe: mark-breathe 1400ms var(--ease-in-out-curve) infinite;
+  --animate-ripple: ripple 2s ease 0s 2;
+  --animate-shine: shine 420ms var(--ease-out-curve) 1;
+  --animate-leader: leader-draw var(--dur-draw) var(--ease-out-curve) 1;
+  --animate-stamp: stamp-land var(--dur-stamp) var(--ease-out-curve) 1;
+  --animate-spin-slow: spin 900ms linear infinite;
+
+  @keyframes dot-drift {
+    from { transform: translate3d(0, 0, 0); }
+    to { transform: translate3d(-24px, -24px, 0); }
+  }
+  @keyframes mark-breathe {
+    50% { opacity: 0.45; }
+  }
+  @keyframes ripple {
+    0%, 100% { transform: translate(-50%, -50%) scale(1); }
+    50% { transform: translate(-50%, -50%) scale(0.9); }
+  }
+  @keyframes shine {
+    from { transform: translateX(-120%); opacity: 0.9; }
+    to { transform: translateX(220%); opacity: 0; }
+  }
+  @keyframes leader-draw {
+    from { transform: scaleX(0); }
+    to { transform: scaleX(1); }
+  }
+  @keyframes stamp-land {
+    from { transform: scale(0.92); opacity: 0; }
+    to { transform: scale(1); opacity: 1; }
+  }
+}
+
+/* The single scene. The same values sit on .dark so `dark:` utilities resolve. */
+:root,
+.dark {
+  color-scheme: dark;
+
+  /* ground and surfaces (lightness ladder, no shadow depth) */
+  --rail: #050f2b;
+  --rail-hover: #0a1a44;
+  --rail-active: #112459;
+  --rail-text: #bfc9de;
+  --rail-muted: #8fa0c0;
+  --rail-border: #16254b;
+  --inset: #0d121a;
+  --ground: #121823;
+  --panel: #171f2c;
+  --raised: #1e2837;
+  --hover: #263143;
+  --bone: #e8e6de;
+  --text-2: #b3b9c6;
+  --text-3: #9099aa;
+  --hairline: #263044;
+  --leader: #4a566b;
+  --line-control: #6b7a92;
+  --scrim: rgb(3 8 20 / 0.72);
+
+  /* the one attention colour */
+  --amber: #f2a93b;
+  --amber-hover: #f7ba5c;
+  --amber-press: #d98e1f;
+  --amber-subtle: #2a2417;
+  --on-amber: #1a1203;
+  --selection: #604b2b;
+
+  /* state, always beside a glyph and a word */
+  --ok: #3dd6a0;
+  --ok-subtle: #0f2f27;
+  --warn: var(--amber);
+  --warn-subtle: var(--amber-subtle);
+  --bad: #ff6a6a;
+  --bad-subtle: #351a1f;
+  --on-bad: #1b0a0e;
+  --info: #6cb2ff;
+  --info-subtle: #14263f;
+  --neutral: #9ba5b6;
+  --neutral-subtle: #232b39;
+
+  /* shadcn semantic names */
+  --background: var(--ground);
+  --foreground: var(--bone);
+  --card: var(--panel);
+  --card-foreground: var(--bone);
+  --popover: var(--raised);
+  --popover-foreground: var(--bone);
+  --primary: var(--amber);
+  --primary-foreground: var(--on-amber);
+  --secondary: var(--raised);
+  --secondary-foreground: var(--bone);
+  --muted: var(--hover);
+  --muted-foreground: var(--text-2);
+  --accent: var(--hover);
+  --accent-foreground: var(--bone);
+  --destructive: var(--bad);
+  --border: var(--hairline);
+  --input: var(--line-control);
+  --ring: var(--amber);
+  --chart-1: var(--info);
+  --chart-2: var(--bone);
+  --chart-3: var(--text-2);
+  --chart-4: var(--text-3);
+  --chart-5: var(--line-control);
+  --sidebar: var(--rail);
+  --sidebar-foreground: var(--rail-text);
+  --sidebar-primary: var(--amber);
+  --sidebar-primary-foreground: var(--on-amber);
+  --sidebar-accent: var(--rail-active);
+  --sidebar-accent-foreground: var(--bone);
+  --sidebar-border: var(--rail-border);
+  --sidebar-ring: var(--amber);
+
+  --radius: 0.25rem;
+
+  /* motion tokens (JS mirror: src/lib/motion.ts) */
+  --dur-0: 0ms;
+  --dur-fast: 125ms;
+  --dur-base: 150ms;
+  --dur-pop: 200ms;
+  --dur-draw: 240ms;
+  --dur-stamp: 180ms;
+  --dur-sheet: 300ms;
+  --stagger: 30ms;
+  --ease-out-curve: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out-curve: cubic-bezier(0.77, 0, 0.175, 1);
+  --ease-drawer-curve: cubic-bezier(0.32, 0.72, 0, 1);
+
+  /* layout */
+  --rail-width: 232px;
+  --topbar-height: 48px;
+  --row-height: 32px;
+  --control-height: 32px;
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  html {
+    @apply font-sans;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-size-adjust: 100%;
+    scrollbar-width: thin;
+    scrollbar-color: var(--rail-active) transparent;
+    /* The sticky 48 px top bar plus 16 px: focus scrolled into view is never under the bar. */
+    scroll-padding-top: 4rem;
+  }
+  body {
+    @apply bg-background text-foreground text-sm;
+    font-variant-numeric: tabular-nums;
+    caret-color: var(--amber);
+    accent-color: var(--bone);
+    overscroll-behavior-y: none;
+  }
+  ::selection {
+    background: var(--selection);
+    color: var(--bone);
+  }
+  a {
+    text-underline-offset: 3px;
+    text-decoration-thickness: 1px;
+  }
+  code,
+  kbd,
+  samp,
+  pre {
+    @apply font-mono;
+    font-variant-numeric: tabular-nums;
+  }
+  h1,
+  h2,
+  h3 {
+    text-wrap: balance;
+  }
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--rail-active);
+    border-radius: 4px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  /* Base UI with <CSPProvider disableStyleElements>: the class it would otherwise inject. */
+  .base-ui-disable-scrollbar {
+    scrollbar-width: none;
+  }
+  .base-ui-disable-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+  /* clipboard.ts fallback buffer: present in the document, never seen. */
+  .clipboard-buffer {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    border: 0;
+    opacity: 0;
+    overflow: hidden;
+  }
+}
+
+/*
+ * Focus: one ring everywhere. Unlayered so it beats the `outline-hidden` and
+ * `outline-none` utilities the vendored components carry. Keyboard focus only.
+ */
+*,
+::before,
+::after {
+  /* the ring colour is set at rest so colour transitions never fade it in (focus ring 0 ms) */
+  outline-color: var(--ring);
+}
+:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+main:focus-visible,
+h1:focus-visible {
+  outline-offset: 4px;
+}
+/* Date and time fields: the native picker stop keeps the ring (the input matches :focus, not always :focus-visible, there). */
+input[type="datetime-local"]:focus,
+input[type="date"]:focus,
+input[type="time"]:focus {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+/* Inline code inside prose: a subtle well, so mono punctuation reads as code, not a typo. */
+.code-inline {
+  border-radius: 2px;
+  background: var(--inset);
+  padding: 0 2px;
+  box-decoration-break: clone;
+}
+
+/*
+ * The command palette's input holds focus for as long as the palette is open,
+ * so the ring wraps its whole field (search icon included) rather than the bare
+ * text input inside it.
+ */
+[data-slot="command-input"]:focus-visible {
+  outline: none;
+}
+[data-slot="input-group"]:has(> [data-slot="command-input"]:focus-visible) {
+  outline: 2px solid var(--ring);
+  outline-offset: 0;
+}
+
+/* Sonner: its runtime <style> injection is stripped at build time (vite.config.ts); the stylesheet ships from the bundle. */
+.toaster [data-sonner-toast] {
+  font-family: var(--font-sans);
+  font-size: 0.8125rem;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-float);
+}
+
+/*
+ * Reduced motion: fewer and gentler, not zero. Transform, filter and layout
+ * motion stops; opacity and colour feedback of 150 ms or less stays; loops and
+ * shimmer end at their static frame; a spinner keeps turning.
+ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  ::before,
+  ::after {
+    animation-iteration-count: 1 !important;
+    transition-duration: var(--dur-base) !important;
+    transition-property: opacity, color, background-color, border-color !important;
+    scroll-behavior: auto !important;
+  }
+  [data-spinner],
+  .animate-spin {
+    animation: spin 900ms linear infinite !important;
+  }
+  .animate-dot-drift,
+  .animate-ripple,
+  .animate-shine,
+  .animate-leader,
+  .animate-stamp,
+  .animate-mark-breathe {
+    animation: none !important;
+  }
+}

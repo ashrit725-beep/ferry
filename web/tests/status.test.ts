@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import type { ApiKeySummary } from '../src/api.ts';
-import { isAdminRole, isJobActive, keyStatus, severityRank, statusLabel, toneFor } from '../src/status.ts';
+import { chainCoverage, isAdminRole, isJobActive, keyStatus, severityRank, statusLabel, toneFor } from '../src/status.ts';
 
 const NOW = Date.parse('2026-10-28T12:00:00.000Z');
 
@@ -73,5 +73,24 @@ describe('roles and jobs', () => {
     assert.equal(isJobActive('queued'), true);
     assert.equal(isJobActive('running'), true);
     for (const s of ['succeeded', 'failed', 'cancelled', '', null]) assert.equal(isJobActive(s), false, String(s));
+  });
+});
+
+describe('chainCoverage', () => {
+  const ok = { ok: true, verified_at: '2026-10-29T18:00:00Z', problem: null, head_seq: 74, seq: 75 };
+  test('a check with nothing appended after it is current', () => {
+    assert.deepEqual(chainCoverage({ head_seq: 75, last_verify: ok }), { kind: 'current', last: ok, checkedTo: 74 });
+  });
+  test('events after the check are not covered by it', () => {
+    assert.deepEqual(chainCoverage({ head_seq: 96, last_verify: ok }), { kind: 'stale', last: ok, checkedTo: 74, since: 22 });
+  });
+  test('a failed check stays failed and no check reads never', () => {
+    const bad = { ...ok, ok: false, problem: 'hash mismatch at #2' };
+    assert.equal(chainCoverage({ head_seq: 75, last_verify: bad }).kind, 'failed');
+    assert.equal(chainCoverage({ head_seq: 9, last_verify: null }).kind, 'never');
+  });
+  test('a record without its own seq never claims coverage', () => {
+    const old = { ...ok, head_seq: null, seq: null };
+    assert.deepEqual(chainCoverage({ head_seq: 75, last_verify: old }), { kind: 'stale', last: old, checkedTo: null, since: null });
   });
 });
