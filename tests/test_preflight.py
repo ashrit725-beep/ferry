@@ -264,3 +264,93 @@ def test_real_llama_server_offline_passes(tmp_path):
         log_path=tmp_path / "out.log", ready_timeout_s=120)
     assert report["verdict"] == "pass", report["failures"]
     assert report["process"]["request"]["usage"]["completion_tokens"] >= 1
+
+
+# --- CLI: report paths, --request-json, Markdown command -----------------------------------------------------
+
+def _fake_report(verdict: str = "pass") -> dict:
+    return {"verdict": verdict, "command": ["true"], "isolation": {"mechanism": "none"}, "process": {"exit_code": 0},
+            "evidence_sources": [], "log_file": "out.log"}
+
+
+def test_a_missing_out_directory_fails_before_the_run(tmp_path, monkeypatch, capsys):
+    import ferry.preflight as preflight_module
+    from ferry import cli
+
+    def must_not_run(*a, **k):
+        raise AssertionError("preflight() ran although --out cannot be written")
+
+    monkeypatch.setattr(preflight_module, "preflight", must_not_run)
+    out = tmp_path / "missing" / "r.json"
+    assert cli.main(["preflight", "--out", str(out), "--", "true"]) == 2
+    err = capsys.readouterr().err
+    assert "ferry preflight: --out" in err and "does not exist" in err and str(tmp_path / "missing") in err
+    assert cli.main(["preflight", "--md", str(tmp_path), "--", "true"]) == 2
+    assert "is a directory" in capsys.readouterr().err
+
+
+def test_a_valid_out_is_written_after_the_verdict_is_printed(tmp_path, monkeypatch, capsys):
+    import ferry.preflight as preflight_module
+    from ferry import cli
+
+    monkeypatch.setattr(preflight_module, "preflight", lambda *a, **k: _fake_report("fail"))
+    out, md = tmp_path / "r.json", tmp_path / "r.md"
+    assert cli.main(["preflight", "--out", str(out), "--md", str(md), "--", "true"]) == 1
+    assert json.loads(out.read_text())["verdict"] == "fail"
+    assert md.read_text().startswith("# Offline preflight (FAIL)")
+    assert "Offline preflight: FAIL" in capsys.readouterr().out
+
+
+def test_a_late_write_error_still_shows_the_verdict(tmp_path, monkeypatch, capsys):
+    import ferry.preflight as preflight_module
+    from ferry import cli
+
+    out = tmp_path / "gone" / "r.json"
+    out.parent.mkdir()
+
+    def run_then_remove(*a, **k):
+        out.parent.rmdir()  # the directory disappears while the command runs
+        return _fake_report("pass")
+
+    monkeypatch.setattr(preflight_module, "preflight", run_then_remove)
+    assert cli.main(["preflight", "--json", "--out", str(out), "--", "true"]) == 2
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["verdict"] == "pass"
+    assert "could not write --out" in captured.err and "(pass) stands" in captured.err
+
+
+def test_an_invalid_request_json_is_a_usage_error(tmp_path, monkeypatch, capsys):
+    import ferry.preflight as preflight_module
+    from ferry import cli
+
+    monkeypatch.setattr(preflight_module, "preflight", lambda *a, **k: pytest.fail("preflight() ran"))
+    bad = tmp_path / "bad.json"
+    bad.write_text("{bad")
+    code = cli.main(["preflight", "--ready-url", "http://127.0.0.1:9/", "--request-url", "http://127.0.0.1:9/x",
+                     "--request-json", str(bad), "--", "true"])
+    err = capsys.readouterr().err
+    assert code == 2
+    assert "--request-json" in err and "not valid JSON" in err and str(bad) in err
+    assert "internal error" not in err
+
+
+def test_markdown_command_is_the_exact_argv(tmp_path):
+    import shlex
+
+    for argv in (["/bin/sh", "-c", 'echo "a b"'], ["python", "-c", "print(`x`)", "a ``` b", "it's"]):
+        md = render_markdown({"verdict": "pass", "command": argv, "isolation": {}, "process": {}})
+        if argv[0] == "/bin/sh":
+            assert "/bin/sh -c 'echo \"a b\"'" in md
+        lines = md.splitlines()
+        start = next(i for i, line in enumerate(lines) if line.startswith("```") and line.endswith("sh"))
+        fence = lines[start][:-2]
+        end = next(i for i in range(start + 1, len(lines)) if lines[i] == fence)
+        assert shlex.split("\n".join(lines[start + 1:end])) == argv
+
+
+def test_markdown_table_cells_survive_pipes_and_newlines():
+    report = {"verdict": "fail", "command": ["x"], "isolation": {"mechanism": "m", "description": "a|b\nc"},
+              "process": {}, "network_attempts": [{"process": "p|q", "pid": 1, "destination": "h\n| x", "count": 1}]}
+    md = render_markdown(report)
+    assert "| Isolation | m: a\\|b c |" in md
+    assert "| p\\|q | 1 | h \\| x | 1 |" in md

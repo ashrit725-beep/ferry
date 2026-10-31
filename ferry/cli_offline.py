@@ -18,11 +18,47 @@ from typing import Any
 from .errors import FerryError
 
 
-def _write_reports(report: dict[str, Any], render, json_out: str | None, md_out: str | None) -> None:
-    if json_out:
-        Path(json_out).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    if md_out:
-        Path(md_out).write_text(render(report), encoding="utf-8")
+def _report_path_problem(flag: str, value: str | None) -> str | None:
+    """Why `value` cannot take a report, checked before the run so a bad path never discards a finished result."""
+    if not value:
+        return None
+    path = Path(value)
+    parent = path.parent
+    if path.is_dir():
+        return f"{flag} {value}: is a directory; give a file path such as {path / 'report'}"
+    if not parent.is_dir():
+        return f"{flag} {value}: directory {parent} does not exist; create it first or choose another path"
+    if not os.access(parent, os.W_OK) or (path.exists() and not os.access(path, os.W_OK)):
+        return f"{flag} {value}: cannot write there (permission denied); choose a writable path"
+    return None
+
+
+def _check_report_paths(command: str, args: argparse.Namespace) -> bool:
+    for flag, value in (("--out", args.out), ("--md", args.md)):
+        problem = _report_path_problem(flag, value)
+        if problem:
+            print(f"ferry {command}: {problem}", file=sys.stderr)
+            return False
+    return True
+
+
+def _finish(command: str, report: dict[str, Any], render, args: argparse.Namespace, print_summary) -> int:
+    """Show the verdict first, then write the files: a late write error must never hide the result."""
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print_summary(report)
+    for flag, value, text in (("--out", args.out, lambda: json.dumps(report, indent=2) + "\n"),
+                              ("--md", args.md, lambda: render(report))):
+        if not value:
+            continue
+        try:
+            Path(value).write_text(text(), encoding="utf-8")
+        except OSError as exc:
+            print(f"ferry {command}: could not write {flag} {value}: {exc.strerror or exc}; the verdict above"
+                  f" ({report['verdict']}) stands, rerun with a writable path to keep the report", file=sys.stderr)
+            return 2
+    return 0 if report["verdict"] == "pass" else 1
 
 
 def _print_lines(title: str, items: list[str]) -> None:
@@ -129,9 +165,20 @@ def cmd_preflight(args: argparse.Namespace) -> int:
         if value and not _is_http_url(value):
             print(f"ferry preflight: {flag} must be an http:// or https:// URL with a host", file=sys.stderr)
             return 2
+    if not _check_report_paths("preflight", args):
+        return 2
     request = None
     if args.request_url:
-        body = json.loads(Path(args.request_json).read_text(encoding="utf-8")) if args.request_json else None
+        body = None
+        if args.request_json:
+            from .cli import UsageError, _read_json_file
+
+            try:
+                body = _read_json_file(args.request_json)
+            except UsageError as exc:
+                print(f"ferry preflight: --request-json: {exc.message}; fix the file or leave out --request-json"
+                      " to send a GET", file=sys.stderr)
+                return 2
         request = {"url": args.request_url, "body": body, "headers": _kv(args.header, "header")}
     report = preflight(
         command, ready_url=args.ready_url, request=request, env=_kv(args.env, "env"), cwd=args.cwd,
@@ -139,39 +186,38 @@ def cmd_preflight(args: argparse.Namespace) -> int:
         allow_attempts=args.allow_attempts, strict=args.strict, python_hook=not args.no_python_hook,
         log_path=Path(args.log) if args.log else None,
     )
-    _write_reports(report, render_markdown, args.out, args.md)
-    if args.json:
-        print(json.dumps(report, indent=2))
-    else:
-        _print_preflight(report)
-    return 0 if report["verdict"] == "pass" else 1
+    return _finish("preflight", report, render_markdown, args, _print_preflight)
 
 
 def cmd_rehearse(args: argparse.Namespace) -> int:
-    from .config import ImportSettings, load_settings
+    from .cli import UsageError, _progress
+    from .config import SIGNER_ROLES, ImportSettings, load_settings
     from .rehearse import MIN_LLAMACPP_BUILD, rehearse, render_markdown
 
-    # The import policy comes from the same places as for the other commands: --config (before or after the
-    # command name), the global --data-dir, FERRY_CONFIG or FERRY_DATA_DIR. The rehearsal itself still imports
+    # A mistyped role is a usage error, as in `ferry verify`, not a verification failure after a full import.
+    if args.require_role:
+        bad = [r for r in args.require_role if r not in SIGNER_ROLES]
+        if bad:
+            raise UsageError(f"unknown role(s) {', '.join(bad)}; roles are: {', '.join(SIGNER_ROLES)}")
+    # The import policy comes from the same places as for the other commands: --config and --data-dir (before or
+    # after the command name), FERRY_CONFIG or FERRY_DATA_DIR. The rehearsal itself still imports
     # into a throwaway data directory.
     config = getattr(args, "config", None)
     data_dir = getattr(args, "config_data_dir", None) or getattr(args, "data_dir", None)
     configured = config or data_dir or os.environ.get("FERRY_CONFIG") or os.environ.get("FERRY_DATA_DIR")
     imports = load_settings(config_path=config, data_dir=data_dir).imports if configured else ImportSettings()
+    if not _check_report_paths("rehearse", args):
+        return 2
     if args.require_role:
-        imports = dataclasses.replace(imports, required_roles=tuple(args.require_role))
-    report = rehearse(
-        Path(args.bundle), trust_dir=Path(args.trust_dir), import_settings=imports, binary=args.binary,
-        prompt=args.prompt, ctx_size=args.ctx_size, max_tokens=args.max_tokens,
-        min_build=None if args.min_build == 0 else (args.min_build or MIN_LLAMACPP_BUILD),
-        require_isolation=not args.allow_no_isolation,
-    )
-    _write_reports(report, render_markdown, args.out, args.md)
-    if args.json:
-        print(json.dumps(report, indent=2))
-    else:
-        _print_rehearsal(report)
-    return 0 if report["verdict"] == "pass" else 1
+        imports = dataclasses.replace(imports, required_roles=tuple(dict.fromkeys(args.require_role)))
+    with _progress("hashing", args) as progress:
+        report = rehearse(
+            Path(args.bundle), trust_dir=Path(args.trust_dir), import_settings=imports, binary=args.binary,
+            prompt=args.prompt, ctx_size=args.ctx_size, max_tokens=args.max_tokens,
+            min_build=None if args.min_build == 0 else (args.min_build or MIN_LLAMACPP_BUILD),
+            require_isolation=not args.allow_no_isolation, progress=progress,
+        )
+    return _finish("rehearse", report, render_markdown, args, _print_rehearsal)
 
 
 def register(subparsers: Any) -> None:
@@ -210,7 +256,9 @@ def register(subparsers: Any) -> None:
     # SUPPRESS: a missing option must not overwrite the global `ferry --config FILE rehearse ...`.
     r.add_argument("--config", metavar="FILE", default=argparse.SUPPRESS,
                    help="ferry.toml whose [import] policy to apply (default: FERRY_CONFIG, or <data dir>/ferry.toml)")
-    r.add_argument("--config-data-dir", help=argparse.SUPPRESS)
+    r.add_argument("--data-dir", metavar="DIR", default=argparse.SUPPRESS,
+                   help="installation whose ferry.toml [import] policy to apply (default: FERRY_DATA_DIR)")
+    r.add_argument("--config-data-dir", help=argparse.SUPPRESS)  # older spelling of --data-dir, kept as an alias
     r.add_argument("--binary", help="llama-server binary (default: llama-server on PATH)")
     r.add_argument("--prompt", default="Reply with one word: ready", help="smoke-test prompt (never stored)")
     r.add_argument("--ctx-size", type=int, default=2048)

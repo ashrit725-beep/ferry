@@ -167,7 +167,18 @@ CREATE INDEX idx_verifications_created ON verifications(created_at);
 CREATE INDEX idx_api_keys_principal ON api_keys(principal_id);
 """
 
-MIGRATIONS: list[tuple[int, str]] = [(1, SCHEMA_V1)]
+# v2: indexes for the reads the console repeats against a log that only grows.
+# (action, ts) serves the Overview traffic window. idx_audit_action stays: as an index on
+# (action, rowid) it gives action-filtered, newest-first pages without a sort, which
+# (action, ts) cannot. (resource, seq) and (actor_type, seq) do the same for those
+# filters, and actor_type's index also serves the facet skip-scan.
+SCHEMA_V2 = """
+CREATE INDEX idx_audit_action_ts ON audit_events(action, ts);
+CREATE INDEX idx_audit_resource_seq ON audit_events(resource, seq);
+CREATE INDEX idx_audit_actor_type_seq ON audit_events(actor_type, seq);
+"""
+
+MIGRATIONS: list[tuple[int, str]] = [(1, SCHEMA_V1), (2, SCHEMA_V2)]
 LATEST_VERSION = MIGRATIONS[-1][0]
 
 

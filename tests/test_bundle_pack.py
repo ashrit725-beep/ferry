@@ -201,12 +201,24 @@ def test_pack_follows_symlinked_sources(ws):
      "", "unknown key artifacts[0].format"),
     ({"name": "x", "version": "1"}, [], "", "at least one [[artifacts]]"),
     ({"version": "1"}, [{"source": "src/LICENSE", "path": "a", "kind": "document"}], "", "bundle.name is required"),
+    # Refused on the connected side: the receiving host's rollback check could not order them.
+    ({"name": "x", "version": "latest"}, [{"source": "src/LICENSE", "path": "a", "kind": "document"}], "",
+     "bundle.version: version 'latest' cannot be ordered for rollback protection"),
+    ({"name": "x", "version": "1.x"}, [{"source": "src/LICENSE", "path": "a", "kind": "document"}], "",
+     "publish versions as MAJOR.MINOR.PATCH"),
 ])
 def test_pack_spec_errors(ws, bundle, artifacts, extra, expected):
     spec = write_spec(ws.root / "bad.toml", bundle=bundle, artifacts=artifacts, extra=extra)
     with pytest.raises(ValidationFailed) as info:
         load_pack_spec(spec)
     assert expected in info.value.message
+
+
+@pytest.mark.parametrize("version", ["1", "1.2.0", "v1.2.0", "1.2.0-rc.1", "1.2.0rc1", "2.0.0+build.7"])
+def test_pack_spec_accepts_versions_rollback_protection_can_order(ws, version):
+    spec = write_spec(ws.root / "ok.toml", bundle={"name": "x", "version": version},
+                      artifacts=[{"source": "src/LICENSE", "path": "a", "kind": "document"}])
+    assert load_pack_spec(spec).version == version
 
 
 def test_pack_spec_not_toml_and_missing_source(ws):

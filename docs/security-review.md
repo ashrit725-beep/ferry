@@ -91,3 +91,46 @@ Resolved on 2026-10-29, after the review (tests in `tests/test_hardening.py`):
   `shasum` checks OK, tampered copy REJECTED, rehearsal PASS, import ACCEPTED,
   allowed request HTTP 200 with a real completion, two denials HTTP 403 before
   inference, audit chain intact).
+
+## Quality pass, 2026-10-30
+
+**What this is:** a second AI-assisted pass over the Python package and CLI,
+run the same way as the review above. Five finders (verify/import, gateway
+security, CLI usability, silent failures, performance) reported 44 findings;
+two refuters per P0/P1 finding (one per P2) tried to disprove each by
+reproducing it at f737b96. None was refuted, though most were downgraded.
+Fixers then changed the code, one module group each, with a test for every
+fix. As before, this is not an independent assessment.
+
+The security-relevant defects (found as P0 or P1 in the verify/import and
+gateway-security areas) are listed here. Severity is the refuters' rating;
+the finder's rating is in brackets. The full list of 44, with each refuter's
+reproduction, the fixes and the tests that cover them, is in
+[reviews/quality-pass-2026-10-30.md](reviews/quality-pass-2026-10-30.md).
+
+| Id | Severity | Finding | Status | Test |
+|---|---|---|---|---|
+| VI-1 | medium [P0] | A valid GGUF whose bytes also run, from byte 0, as a header-less protocol-0 pickle reaching `GLOBAL`/`INST`/`STACK_GLOBAL` was accepted as GGUF, because the header-less pickle scan never ran on files that parsed as GGUF | Fixed: `detect_format` runs the scan on a valid GGUF and classifies such a polyglot as pickle (`polyglot: gguf`), so the pickle policy rejects it | `tests/test_formats.py` |
+| VI-2 | medium [P0] | `version_key` compared non-numeric parts as text, so a signed `v9.0.0` replayed after `v10.0.0` passed rollback protection, and `1.0.0` after `1.0.0rc1` was refused as older | Fixed: versions are parsed (optional `v`, numeric core, pre-release, build); a version whose core is not numeric (`latest`, `1.x`) fails `policy.rollback`, even with `--allow-downgrade` | `tests/test_bundle_rollback.py` |
+| VI-3 (also SF-1) | medium [P1, P0] | Rollback and version-reuse checks ran outside the transaction that registers the bundle, so two concurrent imports of the same name could both register (two copies of one version, or an older one after a newer one) | Fixed: the history check runs again inside the `BEGIN IMMEDIATE` registration transaction; a conflict is recorded as a rejection, and files that call placed are removed unless another bundle uses them | `tests/test_bundle_rollback.py`, `tests/test_bundle_import.py` |
+| VI-4 (also SF-3, integrity-1) | low [P1] | Re-import kept an existing store file of the right size without hashing it, so a corrupted or tampered store file stayed in place while the import reported success | Fixed: an existing file is kept only if it is a regular file, mode 0444 and hashes to its digest; otherwise it is replaced from the verified staged copy and listed as `repaired` in the result and the audit event | `tests/test_bundle_import.py` |
+| VI-5 | medium [P1] | Listing the tar kept every PAX/GNU long header in memory (up to 8 MiB each across about 1,000 members) before any size limit applied; chained extended headers could raise an uncaught `RecursionError` | Fixed: 64 KiB per header and 16 MiB in total while listing, PAX records are dropped after use, and `RecursionError` becomes `archive.readable` | `tests/test_bundle_verify.py` |
+| VI-6 | medium [P1] | `artifacts` rows were first-writer-wins by digest, so a later bundle shipping the same bytes had its signed kind, model name and licence replaced by the first bundle's in the store and the evidence report | Fixed: the newest import that declares the bytes as a model names them, and the evidence report reads each bundle's declaration from its own signed manifest. The console bundle detail page still reads the shared row (see limitations) | `tests/test_bundle_import.py` |
+| GWS-1 | medium [P0] | The login throttle checked and counted in separate steps around a 65 to 75 ms scrypt check, so 20 concurrent guesses against one account all got a password check where the limit is 5 | Fixed: `LoginThrottle.begin`/`finish` count in-flight checks under the throttle lock; at most four scrypt checks run at once in the process | `tests/test_app_admin_api.py` |
+| GWS-2 | low [P1] | `ferry serve` left uvicorn trusting `X-Forwarded-For`/`-Proto` from loopback, so any local client could set the `client_ip` used as the throttle key and in the audit log | Fixed: forwarded headers are ignored unless the peer is in the new `[server] trusted_proxies` (empty by default); `docs/deployment.md` explains the setting | `tests/test_cli.py` |
+| GWS-3 | medium [P1] | Policy warning (shadowed-rule) analysis was quadratic and unbounded, so an auditor could hold a worker for minutes with one `POST /api/policy/validate` of under 1 MiB | Fixed: set-based coverage plus a budget of 5,000,000 comparisons; when it runs out, shadow analysis is skipped with one warning, and errors and other warnings are still computed | `tests/test_policy.py` |
+| GWS-4 (also SF-4) | medium [P1] | A streamed completion was relayed even when its audit event could not be written; the non-stream path already failed closed | Fixed: a `gateway.chat.stream_opened` event is committed before the first byte, and a request whose event cannot be written gets the same 500 "response withheld" as a non-stream one | `tests/test_gateway_openai.py` |
+
+Resolved after the pass, the same day: `ferry pack` refuses a version that
+rollback protection cannot order, before any hashing, so the publisher finds
+out on the connected side instead of at import inside the enclave. The
+ordering rule moved to `ferry/manifest.py` (tests in `tests/test_bundle_pack.py`).
+The spec now matches the code: `docs/design/v1-spec.md` gives the 63-byte
+tensor-name limit, the contiguous tensor layout and `gateway.chat.stream_opened`,
+and `docs/design/v1-additions.md` A1 gives the new version order.
+
+Full suite after the pass, on 2026-10-30: 1471 passed, 6 skipped, 1 failed.
+The failure (`tests/test_preflight.py::test_leaky_app_fails_with_attribution_and_fix`)
+and the sixth skip both depend on the macOS kernel sandbox log, which recorded
+no denials during that run. The same test fails on an unmodified export of
+f737b96 in the same session, so the pass did not cause it.

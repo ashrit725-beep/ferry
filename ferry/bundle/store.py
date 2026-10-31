@@ -7,6 +7,11 @@ at rest. `digest_for_path` maps a path a backend reports (llama-server's
 
 Artifact digests are bare lowercase hex, here and in the database
 (`artifacts.digest`); `path_for` also accepts a `sha256:` prefix.
+
+Imports stage artifacts in `<data_dir>/store/tmp` as `stage-*` files. An import
+that is killed (OOM killer, power loss) leaves its staging files behind;
+`import_lock` removes them at the start of the next import that finds no other
+import running, and `verify_store` reports any it finds.
 """
 
 from __future__ import annotations
@@ -16,8 +21,9 @@ import hashlib
 import os
 import re
 import stat
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from .. import audit
 from ..config import Settings
@@ -25,8 +31,16 @@ from ..db import Database, write_tx
 from ..formats import quote_untrusted
 from ..util import ensure_private_dir, rfc3339
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - not POSIX
+    fcntl = None  # type: ignore[assignment]
+
 DIGEST = re.compile(r"[0-9a-f]{64}")
 CHUNK_SIZE = 1024 * 1024
+STAGING_PREFIX = "stage-"
+IMPORT_LOCK = "import.lock"
+"""In `<data_dir>/store`, beside sha256/ and tmp/."""
 _O_READ = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
 
 
@@ -41,6 +55,82 @@ def staging_dir(settings: Settings) -> Path:
 def ensure_store(settings: Settings) -> None:
     ensure_private_dir(objects_dir(settings))
     ensure_private_dir(staging_dir(settings))
+
+
+def _staging_files(settings: Settings) -> list[tuple[Path, int]]:
+    found: list[tuple[Path, int]] = []
+    try:
+        entries = list(os.scandir(staging_dir(settings)))
+    except OSError:
+        return found
+    for entry in entries:
+        if not entry.name.startswith(STAGING_PREFIX):
+            continue
+        try:
+            st = entry.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        found.append((Path(entry.path), st.st_size if stat.S_ISREG(st.st_mode) else 0))
+    return found
+
+
+def _try_lock(fd: int, flags: int) -> bool:
+    try:
+        fcntl.flock(fd, flags)
+    except BlockingIOError:
+        return False
+    return True
+
+
+def _open_lock(settings: Settings) -> int | None:
+    """The import lock file (store/import.lock), or None where flock is unavailable."""
+    if fcntl is None:
+        return None
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    return os.open(settings.store_dir / IMPORT_LOCK, flags, 0o600)
+
+
+@contextmanager
+def import_lock(settings: Settings) -> Iterator[list[str]]:
+    """Held (shared) for the whole of an import. On entry, if no other import holds
+    it, staging files left by an import that was killed are removed first; the
+    context value lists them. Where flock does not work (no fcntl, or a file
+    system without locks) nothing is swept and imports run unlocked."""
+    ensure_store(settings)
+    fd = _open_lock(settings)
+    swept: list[str] = []
+    try:
+        if fd is not None:
+            try:
+                if _try_lock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB):
+                    for path, _ in _staging_files(settings):
+                        try:
+                            os.unlink(path)
+                            swept.append(path.name)
+                        except FileNotFoundError:
+                            pass
+                fcntl.flock(fd, fcntl.LOCK_SH)
+            except OSError:
+                pass  # ENOLCK/EOPNOTSUPP: no locking on this file system; nothing was swept
+        yield swept
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _import_running(settings: Settings) -> bool:
+    try:
+        fd = _open_lock(settings)
+    except OSError:
+        return False
+    if fd is None:
+        return False
+    try:
+        return not _try_lock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
 
 
 def normalize_digest(digest: str) -> str:
@@ -103,7 +193,7 @@ def verify_store(settings: Settings, *, database: Database | None = None, actor_
     root = objects_dir(settings)
     result: dict[str, Any] = {
         "ok": True, "store_dir": str(root), "checked": 0, "bytes_checked": 0, "mismatches": [], "missing": [],
-        "untracked": [], "problems": [], "warnings": [], "leftover_staging": 0, "verified_at": rfc3339(),
+        "untracked": [], "problems": [], "warnings": [], "leftover_staging": 0, "leftover_staging_bytes": 0, "verified_at": rfc3339(),
         "recorded": False,
     }
     files: list[tuple[str, int]] = []
@@ -128,10 +218,17 @@ def verify_store(settings: Settings, *, database: Database | None = None, actor_
             files.append((entry.name, st.st_size))
             if st.st_mode & 0o222:
                 result["warnings"].append(f"store file {entry.name} is writable (expected mode 0444)")
-    try:
-        result["leftover_staging"] = sum(1 for e in os.scandir(staging_dir(settings)) if e.name.startswith("stage-"))
-    except OSError:
-        pass
+    leftover = _staging_files(settings)
+    result["leftover_staging"] = len(leftover)
+    result["leftover_staging_bytes"] = sum(size for _, size in leftover)
+    if leftover:
+        if _import_running(settings):
+            result["warnings"].append(f"an import is in progress: {len(leftover)} staging file(s) in"
+                                      f" {staging_dir(settings)} belong to it")
+        else:
+            result["warnings"].append(
+                f"{len(leftover)} staging file(s) ({result['leftover_staging_bytes']:,} bytes) in"
+                f" {staging_dir(settings)} were left by an interrupted import; the next import removes them")
 
     total = sum(size for _, size in files)
     done = 0
@@ -163,6 +260,9 @@ def verify_store(settings: Settings, *, database: Database | None = None, actor_
             known = {row["digest"] for row in conn.execute("SELECT digest FROM artifacts")}
             result["missing"] = sorted(known - present)
             result["untracked"] = sorted(present - known)
+            for digest in result["untracked"]:
+                result["warnings"].append(f"store file {digest} is not part of any imported bundle: an import"
+                                          " that failed left it, or one still running has not registered it yet")
             result["ok"] = not (result["mismatches"] or result["missing"] or result["problems"])
             if record:
                 with write_tx(conn):

@@ -17,9 +17,11 @@ from typing import Any
 
 import pytest
 
-from ferry import audit, backends, policy
+from ferry import audit, auth, backends, policy
 from ferry.bundle import importer
 from ferry.errors import FerryError
+from ferry.gateway import admin_api
+from ferry.gateway.security import ApiError
 from ferry.trust import add_key
 
 from helpers_app import ADMIN_USER, CSRF, AppEnv, app_env, bundle_setup, copy_into, wait_for_job
@@ -504,6 +506,22 @@ def test_audit_verify_records_the_check_and_detects_tampering(tmp_path: Path) ->
         assert overview["attention"][0]["severity"] == "error" and "audit chain" in overview["attention"][0]["message"]
 
 
+def test_overview_last_verify_names_the_covered_head(tmp_path: Path) -> None:
+    with app_env(tmp_path / "data") as env:
+        result = env.post("/api/audit/verify").json()
+        last = env.get("/api/overview").json()["audit"]["last_verify"]
+        recorded = env.events("audit.verify")[0]
+        assert last["head_seq"] == result["head_seq"] and last["seq"] == recorded["seq"]
+        assert last["seq"] == last["head_seq"] + 1
+        assert env.post("/api/apps", json={"name": "after-check", "environment": "test"}).status_code in (200, 201)
+        later = env.get("/api/overview").json()["audit"]
+        assert later["last_verify"]["head_seq"] == result["head_seq"]
+        assert later["head_seq"] > later["last_verify"]["seq"]
+        with env.conn() as c:
+            c.execute("UPDATE audit_events SET details = ? WHERE seq = ?", ('{"ok": true}', recorded["seq"]))
+        assert env.get("/api/overview").json()["audit"]["last_verify"]["head_seq"] is None
+
+
 def test_audit_export_is_ndjson_and_recorded(tmp_path: Path) -> None:
     with app_env(tmp_path / "data") as env:
         env.post("/api/apps", {"name": "exported", "environment": "test"})
@@ -833,3 +851,116 @@ def test_overview_numbers_come_from_rows_and_audit_events(tmp_path: Path) -> Non
         assert any("No trusted signing keys" in m for m in messages)
         assert not any("No access policy" in m for m in messages)
         assert len(upstream.chat_requests()) == 2, "denied, invalid and unauthenticated requests never reach the backend"
+
+
+# --- login throttle under concurrency (GWS-1) -------------------------------------------------
+
+
+def test_login_throttle_holds_under_concurrency(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The sign-in endpoint runs in the thread pool, so a burst of guesses must not
+    all pass the throttle check before any of them is counted. Password checks are
+    held open until the burst has been answered, which is the worst interleaving."""
+    with app_env(tmp_path / "data", login_as=None) as env:
+        state = env.client.app.state.ferry
+        throttle = env.client.app.state.ferry_admin.throttle
+        release = threading.Event()
+        original = auth.authenticate_admin
+
+        def held(conn: Any, username: object, password: object) -> Any:
+            release.wait(10)
+            return original(conn, username, password)
+
+        monkeypatch.setattr(auth, "authenticate_admin", held)
+        burst = 20
+        barrier = threading.Barrier(burst)
+        results: list[Any] = []
+        lock = threading.Lock()
+
+        def attempt(i: int) -> None:
+            barrier.wait()
+            try:
+                outcome: Any = admin_api._login(state, throttle, "alice", f"wrong-guess-{i:04d}",
+                                                f"10.0.{i}.1", f"rid{i}")
+            except ApiError as exc:
+                outcome = exc.status
+            with lock:
+                results.append(outcome)
+
+        threads = [threading.Thread(target=attempt, args=(i,)) for i in range(burst)]
+        for t in threads:
+            t.start()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            with lock:
+                if len(results) >= burst - 5:
+                    break
+            time.sleep(0.01)
+        # The right password, sent while the guesses are still being checked, is refused too.
+        try:
+            right: Any = admin_api._login(state, throttle, "alice", "alice-password-1234", "10.9.9.9", "rid-right")
+        except ApiError as exc:
+            right = exc.status
+        release.set()
+        for t in threads:
+            t.join(15)
+        assert Counter(results) == {401: 5, 429: burst - 5}
+        assert right == 429, "a burst must not get more than five password checks for one account"
+        with pytest.raises(ApiError) as locked:
+            admin_api._login(state, throttle, "alice", "alice-password-1234", "10.9.9.9", "rid-after")
+        assert locked.value.status == 429
+        assert "Try again in" in locked.value.message
+
+
+def test_throttle_begin_and_finish_count_in_flight_attempts() -> None:
+    throttle = auth.LoginThrottle(clock=lambda: 1000.0)
+    for _ in range(5):
+        assert throttle.begin("alice", "10.0.0.1") is None
+    refusal = throttle.begin("alice", "10.0.0.2")
+    assert refusal is not None and refusal.busy and refusal.retry_after_s == throttle.busy_retry_s
+    for _ in range(4):
+        assert throttle.finish("alice", "10.0.0.1", ok=False) is None
+    assert throttle.finish("alice", "10.0.0.1", ok=False) == 900
+    refusal = throttle.begin("alice", "10.0.0.3")
+    assert refusal is not None and not refusal.busy and refusal.retry_after_s == 900
+    # A success clears the name; the address keeps its count, and successes never count against it.
+    assert throttle.begin("bob", "10.0.0.4") is None
+    assert throttle.finish("bob", "10.0.0.4", ok=True) is None
+    for _ in range(30):
+        assert throttle.begin("carol", "10.0.0.5") is None
+        throttle.finish("carol", "10.0.0.5", ok=True)
+
+
+def test_concurrent_password_checks_are_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each scrypt check holds 32 MiB, so a burst across many names and addresses
+    must not run more than SCRYPT_CONCURRENCY of them at once."""
+    stored = auth.hash_password("alice-password-1234")
+    real = auth.hashlib.scrypt
+    active, peak = [0], [0]
+    lock = threading.Lock()
+
+    def counting(*args: Any, **kwargs: Any) -> bytes:
+        with lock:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        try:
+            time.sleep(0.05)
+            return real(*args, **kwargs)
+        finally:
+            with lock:
+                active[0] -= 1
+
+    monkeypatch.setattr(auth.hashlib, "scrypt", counting)
+    barrier = threading.Barrier(16)
+    outcomes: list[bool] = []
+
+    def check() -> None:
+        barrier.wait()
+        outcomes.append(auth.verify_password("wrong-password-xx", stored))
+
+    threads = [threading.Thread(target=check) for _ in range(16)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    assert outcomes == [False] * 16
+    assert peak[0] <= auth.SCRYPT_CONCURRENCY

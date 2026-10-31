@@ -23,7 +23,13 @@ RT_PORT="${FERRY_DEMO_RUNTIME_PORT:-8081}"
 PIDS=()
 
 step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
-expect_fail() { if "$@"; then echo "UNEXPECTED: that should have failed"; exit 1; else echo "(failed as expected)"; fi; }
+# Exit 1 is a rejection; exit 2 is a usage, I/O or configuration error and must not pass for one.
+expect_fail() {
+  local rc=0
+  "$@" || rc=$?
+  if [ "$rc" -ne 1 ]; then echo "UNEXPECTED: exit $rc (expected 1, a rejection)"; exit 1; fi
+  echo "(rejected as expected)"
+}
 cleanup() {
   if [ "${FERRY_DEMO_KEEP:-0}" = "1" ]; then
     echo "Leaving gateway and runtime running (pids ${PIDS[*]:-none})."
@@ -114,8 +120,13 @@ DATA="$HIGH/data"
 "$PY" - "$DATA/ferry.toml" <<'PYEOF'
 import sys
 p = sys.argv[1]
-s = open(p).read().replace('required_roles = ["publisher"]', 'required_roles = ["publisher", "reviewer"]')
+s = open(p).read()
+assert 'required_roles = ["publisher"]' in s, "could not set required_roles: ferry.toml has no default line to edit"
+s = s.replace('required_roles = ["publisher"]', 'required_roles = ["publisher", "reviewer"]', 1)
+assert 'required_roles = ["publisher", "reviewer"]' in s, "could not set required_roles"
 open(p, "w").write(s)
+from ferry.config import load_settings
+assert load_settings(config_path=p).imports.required_roles == ("publisher", "reviewer"), "required_roles did not take"
 PYEOF
 cp "$BUNDLE" "$DATA/inbox/"
 

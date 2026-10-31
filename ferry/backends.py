@@ -38,7 +38,7 @@ from .config import Settings
 from .db import write_tx
 from .errors import ConfigError, Conflict, FerryError, NotFound, ValidationFailed
 from .policy import MODEL_NAME
-from .util import canonical_json, rfc3339
+from .util import canonical_json, parse_rfc3339, rfc3339, utc_now
 
 if TYPE_CHECKING:
     from .gateway.state import GatewayState
@@ -54,6 +54,12 @@ MAX_URL_CHARS = 2048
 MAX_TOKEN_FILE_BYTES = 8192
 _TOKEN_CHARS = re.compile(r"^[\x21-\x7e]{1,4096}$")
 HEALTH_TIMEOUT_S = 15.0
+HEALTH_DEADLINE_FACTOR = 2
+"""A whole check (every probe of one backend) must finish within this many
+HEALTH_TIMEOUT_S; the read timeout alone cannot stop a server that trickles bytes."""
+STALE_STATUS_FACTOR = 3
+"""While health checks run, a status older than this many health intervals no
+longer counts: the route is treated as unchecked rather than served on old news."""
 HEALTH_BODY_LIMIT = 1024 * 1024
 MAX_LISTED_MODELS = 200
 DEFAULT_MAX_CONCURRENCY = 4
@@ -599,12 +605,35 @@ class Availability:
     provenance: dict[str, Any]
 
 
-def route_availability(route: Mapping[str, Any], backend: Mapping[str, Any]) -> Availability:
+def status_max_age_s(settings: Settings) -> float | None:
+    """How old a stored backend status may be before routes stop trusting it:
+    STALE_STATUS_FACTOR health intervals, or None when health checks are disabled
+    (then statuses only change on a manual check and never go stale)."""
+    interval = settings.gateway.health_interval_s
+    return interval * STALE_STATUS_FACTOR if interval > 0 else None
+
+
+def _status_age_s(status: Mapping[str, Any]) -> float | None:
+    checked_at = status.get("checked_at")
+    if not isinstance(checked_at, str):
+        return None
+    try:
+        return (utc_now() - parse_rfc3339(checked_at)).total_seconds()
+    except (ValueError, IndexError):
+        return None
+
+
+def route_availability(route: Mapping[str, Any], backend: Mapping[str, Any], *,
+                       max_age_s: float | None = None) -> Availability:
     """`available` = route enabled, backend enabled and up, and (require_verified
-    false or provenance verified)."""
+    false or provenance verified). With `max_age_s` (see status_max_age_s), a
+    status checked longer ago than that, or with no readable check time, counts
+    as unchecked: the health loop has stalled and the backend may have changed."""
     raw = backend.get("last_status")
     status = _json_or_none(raw) if isinstance(raw, str) else raw
-    provenance = evaluate_provenance(route.get("artifact_digest"), status)
+    age = _status_age_s(status) if status and max_age_s is not None else None
+    stale = bool(status) and max_age_s is not None and (age is None or age > max_age_s)
+    provenance = evaluate_provenance(route.get("artifact_digest"), None if stale else status)
 
     def no(code: str, reason: str) -> Availability:
         return Availability(False, code, reason, provenance)
@@ -615,6 +644,11 @@ def route_availability(route: Mapping[str, Any], backend: Mapping[str, Any]) -> 
         return no("backend_disabled", "the backend is disabled")
     if not status:
         return no("backend_unchecked", "the backend has not been health-checked yet")
+    if stale:
+        when = "at an unknown time" if age is None else f"{int(age)} s ago"
+        return no("backend_unchecked",
+                  f"the backend was last health-checked {when}, more than the {max_age_s:g} s allowed; "
+                  "check the gateway log for a stuck health check, or run a check from the console")
     if status.get("state") == "loading":
         return no("backend_loading", "the backend is still loading the model")
     if status.get("state") != "up":
@@ -635,9 +669,9 @@ _ROUTE_SELECT = (
 )
 
 
-def _route_view(row: sqlite3.Row) -> dict[str, Any]:
+def _route_view(row: sqlite3.Row, max_age_s: float | None = None) -> dict[str, Any]:
     backend = {"enabled": row["backend_enabled"], "last_status": row["last_status"]}
-    avail = route_availability(dict(row), backend)
+    avail = route_availability(dict(row), backend, max_age_s=max_age_s)
     return {
         "id": row["id"],
         "model": row["model"],
@@ -655,15 +689,17 @@ def _route_view(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
-def list_routes(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    return [_route_view(r) for r in conn.execute(_ROUTE_SELECT + " ORDER BY r.model")]
+def list_routes(conn: sqlite3.Connection, *, max_age_s: float | None = None) -> list[dict[str, Any]]:
+    """`max_age_s`: see route_availability; the running gateway passes it so the
+    console shows what serving would do."""
+    return [_route_view(r, max_age_s) for r in conn.execute(_ROUTE_SELECT + " ORDER BY r.model")]
 
 
-def get_route(conn: sqlite3.Connection, route_id: int) -> dict[str, Any]:
+def get_route(conn: sqlite3.Connection, route_id: int, *, max_age_s: float | None = None) -> dict[str, Any]:
     row = conn.execute(_ROUTE_SELECT + " WHERE r.id = ?", (route_id,)).fetchone()
     if row is None:
         raise NotFound(f"route {route_id} does not exist")
-    return _route_view(row)
+    return _route_view(row, max_age_s)
 
 
 def route_for_model(conn: sqlite3.Connection, model: str) -> dict[str, Any] | None:
@@ -908,10 +944,25 @@ async def check_backend(backend: Mapping[str, Any], client: httpx.AsyncClient, s
                         egress: EgressGuard | None = None) -> dict[str, Any]:
     """Probe one backend and return its status:
     {state: up|down|loading, checked_at, latency_ms, http_status, version, models, served, error}.
-    Never raises for backend problems; they become state "down" with an error."""
+    Never raises for backend problems; they become state "down" with an error.
+    The whole check is bounded by HEALTH_DEADLINE_FACTOR * HEALTH_TIMEOUT_S, so a
+    backend that answers slowly but steadily cannot hold up a health pass."""
     started = time.monotonic()
     status: dict[str, Any] = {"state": "down", "checked_at": rfc3339(), "latency_ms": 0, "http_status": None,
                               "version": None, "models": [], "served": [], "error": None}
+    deadline = HEALTH_TIMEOUT_S * HEALTH_DEADLINE_FACTOR
+    try:
+        await asyncio.wait_for(_probe_backend(backend, client, settings, egress, status), deadline)
+    except TimeoutError:
+        status = {**status, "state": "down", "http_status": None, "version": None, "models": [], "served": [],
+                  "error": f"health check exceeded {deadline:g} s; the backend accepted the connection but did not "
+                           "finish answering (is it wedged, or behind a slow proxy?)"}
+    status["latency_ms"] = int((time.monotonic() - started) * 1000)
+    return status
+
+
+async def _probe_backend(backend: Mapping[str, Any], client: httpx.AsyncClient, settings: Settings,
+                         egress: EgressGuard | None, status: dict[str, Any]) -> None:
     try:
         guard = egress or EgressGuard(settings.gateway.allow_public_backends, ttl_s=0)
         target = await guard.acheck(backend["base_url"])
@@ -937,8 +988,6 @@ async def check_backend(backend: Mapping[str, Any], client: httpx.AsyncClient, s
         status.update(state="down", error=exc.message)
     except httpx.HTTPError as exc:
         status.update(state="down", error=_describe_http_error(exc))
-    status["latency_ms"] = int((time.monotonic() - started) * 1000)
-    return status
 
 
 def record_health(conn: sqlite3.Connection, backend_id: int, status: Mapping[str, Any], *,

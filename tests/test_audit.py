@@ -5,11 +5,14 @@ from __future__ import annotations
 import io
 import json
 import math
+import sqlite3
+from pathlib import Path
 
 import pytest
 
-from ferry import audit, crypto
-from ferry.db import write_tx
+from ferry import audit, cli, crypto, db
+from ferry.db import Database, write_tx
+from ferry.gateway import admin_api
 from ferry.util import canonical_json
 
 
@@ -318,3 +321,145 @@ def test_export_jsonl_writes_every_event_oldest_first(populated) -> None:
     assert all(line == canonical_json(e).decode() for line, e in zip(lines, events))
     assert all(audit.compute_hash(e) == e["hash"] for e in events)
     assert events[1]["prev_hash"] == events[0]["hash"]
+
+
+def test_facets_list_every_value_present_including_off_vocabulary_ones(populated) -> None:
+    _sql(populated, "UPDATE audit_events SET outcome = 'tampered' WHERE seq = 2")
+    f = audit.facets(populated)
+    assert f["outcomes"] == ["denied", "success", "tampered"]
+    assert f["actions"] == ["bundle.import", "bundle.verify", "gateway.chat.completions", "policy.activate"]
+    assert f["actor_types"] == ["admin", "app", "cli"]
+
+
+def test_facets_of_an_empty_log(conn) -> None:
+    assert audit.facets(conn) == {"actions": [], "outcomes": [], "actor_types": []}
+
+
+def test_export_reports_the_head_of_what_it_wrote(populated) -> None:
+    buf = io.StringIO()
+    written = audit.export(populated, buf)
+    last = json.loads(buf.getvalue().splitlines()[-1])
+    assert written == {"events": 4, "head_seq": last["seq"], "head_hash": last["hash"]}
+
+
+def test_export_of_an_empty_log_reports_the_genesis_head(conn) -> None:
+    assert audit.export(conn, io.StringIO()) == {"events": 0, "head_seq": 0, "head_hash": audit.GENESIS_HASH}
+
+
+# --- the audit.export record vouches for the exported file (SF-8) -----------------
+
+
+def _append_after_export(monkeypatch, database: Database) -> None:
+    """Make audit.export append one event from another connection right after it writes,
+    as a gateway request audited between the export and its own record would."""
+    original = audit.export
+
+    def racing(conn, fh):
+        result = original(conn, fh)
+        with database.session() as other:
+            audit.append_event(other, actor_type="system", actor_id="health", action="backend.health",
+                               resource="backend:b", outcome="success")
+        return result
+
+    monkeypatch.setattr(audit, "export", racing)
+
+
+def _assert_record_matches_last_line(conn: sqlite3.Connection, lines: list[str]) -> None:
+    last = json.loads(lines[-1])
+    record = audit.query_events(conn, action="audit.export", limit=1)[0]["details"]
+    assert record["events"] == len(lines)
+    assert (record["head_seq"], record["head_hash"]) == (last["seq"], last["hash"])
+    assert audit.head(conn)["seq"] == last["seq"] + 2, "the racing event and the export record follow the file"
+
+
+def test_api_export_record_names_the_last_exported_event(tmp_path: Path, monkeypatch) -> None:
+    from helpers_app import app_env
+
+    with app_env(tmp_path / "data") as env:
+        env.post("/api/apps", {"name": "exported", "environment": "test"})
+        _append_after_export(monkeypatch, env.database)
+        response = env.get("/api/audit/export")
+        assert response.status_code == 200
+        with env.conn() as c:
+            _assert_record_matches_last_line(c, response.text.splitlines())
+
+
+def test_cli_export_record_names_the_last_exported_event(settings, conn, tmp_path: Path, monkeypatch) -> None:
+    _append(conn, 3)
+    _append_after_export(monkeypatch, Database(settings.db_path))
+    out = tmp_path / "audit.ndjson"
+    assert cli.main(["--data-dir", str(settings.data_dir), "audit", "export", "--out", str(out)]) == 0
+    _assert_record_matches_last_line(conn, out.read_text().splitlines())
+
+
+# --- query plans and the v2 migration (perf-2, perf-3) -----------------------------
+
+
+def _plans(conn: sqlite3.Connection, run) -> list[str]:
+    """EXPLAIN QUERY PLAN of every audit_events statement `run` executes."""
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+    try:
+        run()
+    finally:
+        conn.set_trace_callback(None)
+    plans = []
+    for sql in statements:
+        if "audit_events" in sql and sql.lstrip().upper().startswith("SELECT"):
+            plans.append(" | ".join(r[3] for r in conn.execute("EXPLAIN QUERY PLAN " + sql)))
+    assert plans, "nothing was traced"
+    return plans
+
+
+def test_traffic_summary_searches_the_action_ts_index(populated) -> None:
+    plans = _plans(populated, lambda: admin_api.traffic_summary(populated, "2000-01-01T00:00:00.000Z"))
+    assert all("action=? AND ts>?" in p for p in plans), plans
+
+
+def test_facets_and_filtered_pages_do_not_scan_the_log(populated) -> None:
+    for run in (lambda: audit.facets(populated),
+                lambda: audit.query_events(populated, resource="bundle:missing"),
+                lambda: audit.query_events(populated, actor_type="system"),
+                lambda: audit.query_events(populated, action="gateway.chat.completions"),
+                lambda: audit.query_events(populated, outcome="denied")):
+        for plan in _plans(populated, run):
+            assert "SCAN audit_events" not in plan and "TEMP B-TREE" not in plan, plan
+
+
+def _chat(conn: sqlite3.Connection, outcome: str, env: str, ms: int) -> None:
+    audit.append_event(conn, actor_type="app", actor_id="app-1", action=admin_api.CHAT_ACTION, resource="model:m",
+                       outcome=outcome, details={"environment": env, "latency_ms": ms})
+
+
+def _indexes(conn: sqlite3.Connection) -> set[str]:
+    return {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'"
+                                       " AND tbl_name = 'audit_events'")}
+
+
+def test_a_v1_database_is_upgraded_to_v2_with_the_same_traffic_summary(tmp_path: Path) -> None:
+    path = tmp_path / "v1" / "ferry.db"
+    path.parent.mkdir()
+    c = db.connect(path)
+    try:
+        db.current_version(c)
+        with write_tx(c):
+            for statement in db._statements(db.SCHEMA_V1):
+                c.execute(statement)
+            c.execute("INSERT INTO schema_migrations (version, applied_at) VALUES (1, '2026-01-01T00:00:00.000Z')")
+        for i, (outcome, env) in enumerate([("success", "test"), ("success", "pilot"), ("denied", "production"),
+                                            ("error", "test"), ("success", "production")]):
+            _chat(c, outcome, env, 10 * (i + 1))
+        audit.append_event(c, actor_type="cli", actor_id="a", action="bundle.import", resource="bundle:x",
+                           outcome="success")
+        assert "idx_audit_action_ts" not in _indexes(c)
+        before = admin_api.traffic_summary(c, "2000-01-01T00:00:00.000Z")
+    finally:
+        c.close()
+
+    assert Database(path).init() == db.LATEST_VERSION == 2
+    with Database(path).session() as c:
+        assert {"idx_audit_action_ts", "idx_audit_resource_seq", "idx_audit_actor_type_seq",
+                "idx_audit_action"} <= _indexes(c)
+        assert admin_api.traffic_summary(c, "2000-01-01T00:00:00.000Z") == before
+        assert before[0]["total"] == 5 and before[0]["success"] == 3 and before[1]["production"] == 2
+        assert audit.verify_chain(c)["ok"] is True

@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import sqlite3
 import time
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
@@ -114,6 +115,39 @@ def _write_record(state: GatewayState, rec: _Record) -> None:
         audit.append_event(conn, actor_type="app", actor_id=rec.actor_id, action=rec.action, resource=rec.resource,
                            outcome=rec.outcome, correlation_id=rec.request_id, policy_version=rec.policy_version,
                            details=rec.details)
+
+
+STREAM_OPENED_ACTION = "gateway.chat.stream_opened"
+
+
+def _write_stream_opened(state: GatewayState, rec: _Record) -> None:
+    """Commit a `gateway.chat.stream_opened` event before a stream's first byte is relayed.
+
+    A streamed completion's `gateway.chat.completions` event can only be written when the
+    stream ends, after the caller has the text. This committed write proves the audit log
+    takes writes for this request (lock, permissions, disk) and leaves a trace in the chain
+    even if the closing write later fails. Blocking: run it in a worker thread."""
+    details = {k: rec.details.get(k) for k in ("model", "backend", "route_id", "artifact_digest", "provenance",
+                                                "max_tokens_effective", "key_id", "environment")}
+    details["stream"] = True
+    with state.db.session() as conn:
+        audit.append_event(conn, actor_type="app", actor_id=rec.actor_id, action=STREAM_OPENED_ACTION,
+                           resource=rec.resource, outcome="accepted", correlation_id=rec.request_id,
+                           policy_version=rec.policy_version, details=details)
+
+
+def _audit_failure_text(exc: BaseException) -> str:
+    """The exception class, plus SQLite's own message (fixed text such as 'database or
+    disk is full', never request data) so the operator can see why the write failed."""
+    if isinstance(exc, sqlite3.Error):
+        return f"{type(exc).__name__}: {exc}"
+    return type(exc).__name__
+
+
+def _withheld(rid: str) -> JSONResponse:
+    return _json(500, openai_error("The request could not be recorded in the audit log, so the response was "
+                                   f"withheld (request id {rid}). Check that the data directory is writable, "
+                                   "has free space and is not locked by another process.", "internal_error"), rid)
 
 
 def _record_usage(rec: _Record, usage: Any) -> None:
@@ -403,7 +437,8 @@ def _authorize_and_route(state: GatewayState, identity: auth.AppIdentity, chat: 
                         outcome="rejected", error_type="model_not_found")
     rec.details.update(route_id=route["id"], backend=route["backend_name"], artifact_digest=route["artifact_digest"])
     availability = backends.route_availability(
-        route, {"enabled": route["backend_enabled"], "last_status": route["last_status"]})
+        route, {"enabled": route["backend_enabled"], "last_status": route["last_status"]},
+        max_age_s=backends.status_max_age_s(state.settings))
     rec.details["provenance"] = availability.provenance["state"]
     if not availability.available:
         raise _ApiError(503, "backend_unavailable", f"The model '{chat.model}' is unavailable: {availability.reason}.",
@@ -574,6 +609,10 @@ async def _complete(state: GatewayState, plan: _Plan, request: httpx.Request, re
     return _json(200, data, rec.request_id, _limit_headers(plan))
 
 
+class _AuditUnwritable(Exception):
+    """The audit log refused a write the request cannot be delivered without."""
+
+
 class _StreamFailed(Exception):
     def __init__(self, error_type: str, message: str) -> None:
         super().__init__(message)
@@ -689,7 +728,8 @@ class _StreamRelay:
             try:
                 await run_in_threadpool(_write_record, self.state, self.rec)
             except Exception as exc:
-                log.error("audit write for streamed request %s failed: %s", self.rec.request_id, type(exc).__name__)
+                log.error("audit write for streamed request %s failed after it was delivered (its %s event "
+                          "is in the log): %s", self.rec.request_id, STREAM_OPENED_ACTION, _audit_failure_text(exc))
 
 
 class _RelayResponse(StreamingResponse):
@@ -716,6 +756,15 @@ async def _open_stream(state: GatewayState, plan: _Plan, request: httpx.Request,
         if "text/event-stream" not in upstream.headers.get("content-type", "").lower():
             raise _backend_failed("invalid_response", "The backend did not answer with an event stream.")
         _check_identity_encoding(upstream)
+        # Fail closed, like a non-streamed completion: nothing is relayed unless the audit log
+        # has taken this request's opening event. Shielded, so the write is not left half-done.
+        with anyio.CancelScope(shield=True):
+            try:
+                await run_in_threadpool(_write_stream_opened, state, rec)
+            except Exception as exc:  # noqa: BLE001 - any failure to record must withhold the stream
+                log.error("audit write for streamed request %s failed before the stream started: %s",
+                          rec.request_id, _audit_failure_text(exc))
+                raise _AuditUnwritable() from None
     except BaseException:
         with anyio.CancelScope(shield=True):
             await upstream.aclose()
@@ -788,6 +837,9 @@ async def chat_completions(request: Request) -> Response:
         if exc.audit_detail:
             rec.details["error"] = exc.audit_detail
         response = _json(exc.status, openai_error(exc.message, exc.kind), rid, exc.headers)
+    except _AuditUnwritable:
+        rec.finish("error", 500, "audit_unwritable")
+        response = _withheld(rid)
     except Exception as exc:
         log.error("chat completion %s failed: %s", rid, type(exc).__name__)
         rec.finish("error", 500, "internal_error")
@@ -797,11 +849,10 @@ async def chat_completions(request: Request) -> Response:
     try:
         await run_in_threadpool(_write_record, state, rec)
     except Exception as exc:
-        log.error("audit write for %s failed: %s", rid, type(exc).__name__)
+        log.error("audit write for %s failed: %s", rid, _audit_failure_text(exc))
         if response.status_code < 400:
             # Fail closed: a completion that cannot be recorded is not delivered.
-            return _json(500, openai_error("The request could not be recorded in the audit log, so the response "
-                                           f"was withheld (request id {rid}).", "internal_error"), rid)
+            return _withheld(rid)
     return response
 
 
@@ -847,10 +898,9 @@ async def list_models(request: Request) -> Response:
     try:
         await run_in_threadpool(_write_record, state, rec)
     except Exception as exc:
-        log.error("audit write for %s failed: %s", rid, type(exc).__name__)
+        log.error("audit write for %s failed: %s", rid, _audit_failure_text(exc))
         if response.status_code < 400:
-            return _json(500, openai_error("The request could not be recorded in the audit log, so the response "
-                                           f"was withheld (request id {rid}).", "internal_error"), rid)
+            return _withheld(rid)
     return response
 
 

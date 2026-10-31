@@ -38,6 +38,7 @@ from starlette.responses import Response
 
 from .. import auth
 from ..config import Settings
+from ..errors import operator_detail, operator_traceback
 from .limits import ASGIApp, Message, Receive, Scope, Send, request_id_for
 
 log = logging.getLogger("ferry.gateway.security")
@@ -340,8 +341,10 @@ class SecurityHeadersMiddleware:
             if started:
                 raise
             rid = request_id_for(scope)
-            # The exception text can carry request data, so only its type is logged.
-            log.error("unhandled %s for %s %s (request id %s)", type(exc).__name__, scope.get("method"), path, rid)
+            # The exception text can carry request data, so it is logged only for the
+            # kinds whose text is fixed by the system; the stack is logged without it.
+            log.error("unhandled %s for %s %s (request id %s)\n%s", operator_detail(exc), scope.get("method"),
+                      path, rid, operator_traceback(exc))
             await _internal_error(send, path, rid)
 
 

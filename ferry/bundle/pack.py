@@ -37,7 +37,8 @@ from .. import __version__, crypto
 from ..config import MODEL_FORMATS, ImportSettings
 from ..errors import Conflict, CryptoError, FerryError, ValidationFailed
 from ..formats import FormatInfo, detect_format
-from ..manifest import (RFC3339, Manifest, build_manifest, dump_manifest, parse_manifest, validate_manifest)
+from ..manifest import (RFC3339, Manifest, UnorderableVersion, build_manifest, dump_manifest, parse_manifest,
+                        validate_manifest, version_key)
 from ..util import atomic_write, parse_rfc3339, rfc3339, utc_now
 from .verify import CHUNK_SIZE, Progress, integrity_check
 
@@ -169,6 +170,13 @@ def load_pack_spec(spec_path: str | Path) -> PackSpec:
     problems = validate_manifest(probe)
     if problems:
         raise ValidationFailed(f"{spec_path}: invalid pack spec: " + "; ".join(problems), details={"errors": problems})
+    try:
+        version_key(spec.version)
+    except UnorderableVersion as exc:
+        # Refuse it here, before hashing and before the transfer: the receiving host's
+        # rollback protection (policy.rollback) refuses such a bundle at verify and import.
+        raise ValidationFailed(f"{spec_path}: invalid pack spec: bundle.version: {exc}",
+                               details={"errors": [f"bundle.version: {exc}"]}) from None
     return spec
 
 

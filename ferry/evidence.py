@@ -45,17 +45,36 @@ def _json(text: str | None, default: Any) -> Any:
         return default
 
 
+def _declared(manifest_text: str | None) -> dict[str, dict[str, Any]]:
+    """Each artifact path's signed declaration (kind, model) in one bundle's manifest."""
+    doc = _json(manifest_text, {})
+    entries = doc.get("artifacts") if isinstance(doc, dict) else None
+    return {e["path"]: e for e in entries or [] if isinstance(e, dict) and isinstance(e.get("path"), str)}
+
+
 def _bundles(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     artifacts: dict[str, list[dict[str, Any]]] = {}
+    declared: dict[str, dict[str, dict[str, Any]]] = {}
     for row in conn.execute(
-        "SELECT ba.bundle_id, ba.path, a.digest, a.size, a.kind, a.format, a.model_name, a.metadata"
-        " FROM bundle_artifacts ba JOIN artifacts a ON a.digest = ba.digest ORDER BY ba.bundle_id, ba.path"
+        "SELECT ba.bundle_id, ba.path, a.digest, a.size, a.kind, a.format, a.model_name, a.metadata, b.manifest"
+        " FROM bundle_artifacts ba JOIN artifacts a ON a.digest = ba.digest"
+        " JOIN bundles b ON b.bundle_id = ba.bundle_id ORDER BY ba.bundle_id, ba.path"
     ):
         meta = _json(row["metadata"], {})
         model = meta.get("model") if isinstance(meta, dict) and isinstance(meta.get("model"), dict) else {}
+        kind, model_name = row["kind"], row["model_name"]
+        # The same bytes can be declared differently by two bundles: report what this
+        # bundle's signers declared, not whichever declaration the artifacts row holds.
+        if row["bundle_id"] not in declared:
+            declared[row["bundle_id"]] = _declared(row["manifest"])
+        entry = declared[row["bundle_id"]].get(row["path"])
+        if entry is not None:
+            kind = entry.get("kind", kind)
+            model = entry["model"] if isinstance(entry.get("model"), dict) else {}
+            model_name = model.get("name")
         artifacts.setdefault(row["bundle_id"], []).append({
-            "path": row["path"], "sha256": row["digest"], "size": row["size"], "kind": row["kind"],
-            "format": row["format"], "model_name": row["model_name"], "license": model.get("license"),
+            "path": row["path"], "sha256": row["digest"], "size": row["size"], "kind": kind,
+            "format": row["format"], "model_name": model_name, "license": model.get("license"),
             "source_uri": model.get("source_uri"), "source_revision": model.get("source_revision"),
         })
     return [
@@ -128,11 +147,58 @@ def _last_checkpoint(conn: sqlite3.Connection) -> dict[str, Any] | None:
             "signed": event["details"].get("signed"), "key_id": event["details"].get("key_id")}
 
 
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _last_full_verification(conn: sqlite3.Connection) -> dict[str, Any] | None:
+    """The newest recorded full verification (POST /api/audit/verify, `ferry audit
+    verify`), or None if there is none this report can build on."""
+    events = audit.query_events(conn, action="audit.verify", limit=1)
+    if not events:
+        return None
+    event = events[0]
+    d = event["details"]
+    head_seq, head_hash = d.get("head_seq"), d.get("head_hash")
+    if (event.get("integrity") or not isinstance(d.get("ok"), bool) or isinstance(head_seq, bool)
+            or not isinstance(head_seq, int) or not 0 <= head_seq < event["seq"]
+            or not isinstance(head_hash, str) or not _HEX64.fullmatch(head_hash)):
+        return None
+    return {"seq": event["seq"], "recorded_at": event["ts"], "actor": f"{event['actor_type']}:{event['actor_id']}",
+            "via": d.get("via"), "ok": d["ok"], "events_checked": d.get("events_checked"), "head_seq": head_seq,
+            "head_hash": head_hash, "first_bad_seq": d.get("first_bad_seq"), "problem": d.get("problem")}
+
+
+def _audit_status(conn: sqlite3.Connection) -> dict[str, Any]:
+    """The audit chain's status without re-reading the whole log on every report.
+
+    A full verification is O(events) and the gateway writes one event per request, so
+    the report builds on the last recorded full verification: it confirms that
+    verification's head is still in place and recomputes only the events after it. A
+    recorded break is reported as it was found (a broken chain does not mend itself).
+    The report runs a full pass only when no verification is recorded, or the last one
+    failed without naming a broken event (a checkpoint signature that did not verify)."""
+    last = _last_full_verification(conn)
+    first_bad = last["first_bad_seq"] if last else None
+    if last is None or (not last["ok"] and (isinstance(first_bad, bool) or not isinstance(first_bad, int))):
+        chain = audit.verify_chain(conn)
+        chain["method"] = "full"
+    elif not last["ok"]:
+        chain = {"ok": False, "events_checked": last["events_checked"], "head_seq": last["head_seq"],
+                 "head_hash": last["head_hash"], "first_bad_seq": last["first_bad_seq"],
+                 "problem": last["problem"] or "the last full verification failed", "checkpoint_verified": False,
+                 "verified_at": last["recorded_at"], "method": "recorded"}
+    else:
+        chain = audit.verify_chain(conn, start=(last["head_seq"], last["head_hash"]))
+        chain["method"] = "incremental"
+    chain["last_full_verification"] = last
+    return chain
+
+
 def build_evidence(settings: Settings, conn: sqlite3.Connection, *, now: Any = None) -> dict[str, Any]:
     """The evidence report as JSON-serializable data (spec section 10)."""
     stamp = now or utc_now()
     trust = load_trust_store(settings.trust_dir)
-    chain = audit.verify_chain(conn)
+    chain = _audit_status(conn)
     chain["last_checkpoint"] = _last_checkpoint(conn)
     return {
         "report": REPORT_SCHEMA,
@@ -199,17 +265,31 @@ def _size(value: Any) -> str:
 
 
 def _audit_section(chain: dict[str, Any]) -> list[str]:
-    if chain.get("ok"):
+    last = chain.get("last_full_verification") if isinstance(chain.get("last_full_verification"), dict) else None
+    method = chain.get("method")
+    if chain.get("ok") and method == "incremental" and last:
+        status = (f"**Intact.** The full verification recorded {_text(last.get('recorded_at'))} by "
+                  f"{_text(last.get('actor'))} found every event through #{_text(last.get('head_seq'))} intact; that "
+                  "event still carries the recorded hash, and every event since matches its content and its "
+                  "predecessor. Edits to older events show only in a full verification: run `ferry audit verify` "
+                  "or Verify on the console's Audit page.")
+    elif chain.get("ok"):
         status = "**Intact.** Every event's hash matches its content and its predecessor."
     else:
         status = (f"**BROKEN at event #{_text(chain.get('first_bad_seq'))}:** {_text(chain.get('problem'))}. Events "
                   "from that point on cannot be relied on.")
+        if method == "recorded" and last:
+            status += (f" Found by the full verification recorded {_text(last.get('recorded_at'))} by "
+                       f"{_text(last.get('actor'))}; run `ferry audit verify` to check again.")
     lines = ["## Audit chain", "", status, ""]
     lines += _table(["Field", "Value"], [
-        ["Events checked", _size(chain.get("events_checked"))],
+        ["Events checked", _size(chain.get("events_checked"))
+         + (" (since the last full verification)" if method == "incremental" else "")],
         ["Head sequence number", _size(chain.get("head_seq"))],
         ["Head hash", _code(chain.get("head_hash"))],
         ["Verified at", _text(chain.get("verified_at"))],
+        ["Last full verification", f"{_text(last.get('recorded_at'))} by {_text(last.get('actor'))}, through event "
+                                   f"#{_size(last.get('head_seq'))}" if last else "none recorded"],
     ])
     cp = chain.get("last_checkpoint")
     lines += [""]
@@ -286,9 +366,9 @@ def _verifications_section(v: dict[str, Any]) -> list[str]:
 
 def _routes_section(e: dict[str, Any]) -> list[str]:
     lines = ["## Routes and model provenance", "",
-             "Provenance `verified` means the backend reported serving a file from Ferry's content-addressed store "
-             "whose digest equals the route's pin. It catches misconfiguration; a compromised backend can report "
-             "anything.", ""]
+             ("Provenance `verified` means the backend reported serving a file from Ferry's content-addressed store "
+              "whose digest equals the route's pin. It catches misconfiguration; a compromised backend can report "
+              "anything."), ""]
     routes = e.get("routes") or []
     if not routes:
         return lines + ["No routes are configured.", ""]
@@ -321,8 +401,8 @@ def _policy_section(e: dict[str, Any]) -> list[str]:
             ["Rules", _size(active.get("rule_count"))],
             ["Comment", _text(active.get("comment")) or "none"],
         ])
-        lines += ["", "Active document (default deny: a request is allowed only by an allow rule that no deny rule "
-                      "overrides):", ""]
+        lines += ["", ("Active document (default deny: a request is allowed only by an allow rule that no deny rule "
+                       "overrides):"), ""]
         lines += _fenced(json.dumps(active.get("document"), indent=2, sort_keys=True), "json")
     else:
         lines.append("**No active policy: every gateway request is denied.**")
@@ -366,6 +446,6 @@ def render_markdown(evidence: dict[str, Any]) -> str:
                                              for d in e.get("dependencies") or []])
     lines += ["", "## Effective configuration", ""]
     lines += _fenced(json.dumps(config, indent=2, sort_keys=True), "json")
-    lines += ["", "---", "", "Generated by `ferry evidence`. Configuration and event evidence, not a compliance "
-                             "certification.", ""]
+    lines += ["", "---", "", ("Generated by `ferry evidence`. Configuration and event evidence, not a compliance "
+                              "certification."), ""]
     return "\n".join(lines)

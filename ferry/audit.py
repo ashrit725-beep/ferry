@@ -84,8 +84,17 @@ def sanitize(value: Any, _depth: int = 0) -> Any:
     return text if len(text) <= _MAX_STRING else text[:_MAX_STRING] + "…[truncated]"
 
 
-def compute_hash(event: dict[str, Any]) -> str:
-    return sha256_hex(canonical_json({k: event[k] for k in HASHED_FIELDS}))
+def compute_hash(event: dict[str, Any], details_json: bytes | None = None) -> str:
+    """SHA-256 of the event's canonical form. `details_json`, when given, must be
+    canonical_json(event["details"]); verify_chain passes the bytes it already
+    encoded so each event's details are serialized once, not twice."""
+    if details_json is None:
+        return sha256_hex(canonical_json({k: event[k] for k in HASHED_FIELDS}))
+    # canonical_json sorts keys, so "details" sits between the fields that sort before
+    # it and those that sort after it; both groups are non-empty.
+    before = canonical_json({k: event[k] for k in HASHED_FIELDS if k < "details"})
+    after = canonical_json({k: event[k] for k in HASHED_FIELDS if k > "details"})
+    return sha256_hex(before[:-1] + b',"details":' + details_json + b"," + after[1:])
 
 
 def _row_to_event(row: sqlite3.Row) -> dict[str, Any]:
@@ -174,9 +183,17 @@ def head(conn: sqlite3.Connection) -> dict[str, Any]:
     return {"seq": row["seq"], "hash": row["hash"], "ts": row["ts"]}
 
 
-def verify_chain(conn: sqlite3.Connection, checkpoint: dict[str, Any] | None = None) -> dict[str, Any]:
+def verify_chain(conn: sqlite3.Connection, checkpoint: dict[str, Any] | None = None, *,
+                 start: tuple[int, str] | None = None) -> dict[str, Any]:
     """Recompute the whole chain. If `checkpoint` ({seq, hash}) is given, also
-    confirm the log still contains that exact event."""
+    confirm the log still contains that exact event.
+
+    With `start` ((seq, hash), the head an earlier full verification recorded) the
+    check is incremental: it confirms the event at that seq still carries that hash
+    and recomputes only the events after it. It cannot see an event before that
+    seq being edited in place; only a full verification can."""
+    if start is not None and checkpoint is not None:
+        raise ValueError("verify_chain: pass a checkpoint or a start point, not both")
     expected, prev, checked = 1, GENESIS_HASH, 0
     # A checkpoint of an empty log (seq 0) names no event; it holds if it carries the genesis hash.
     checkpoint_seen = checkpoint is None or (checkpoint.get("seq") == 0 and checkpoint.get("hash") == GENESIS_HASH)
@@ -193,7 +210,21 @@ def verify_chain(conn: sqlite3.Connection, checkpoint: dict[str, Any] | None = N
             "verified_at": rfc3339(),
         }
 
-    cur = conn.execute("SELECT * FROM audit_events ORDER BY seq ASC")
+    after_seq = 0
+    if start is not None:
+        start_seq, start_hash = int(start[0]), str(start[1])
+        expected, prev, after_seq = start_seq + 1, start_hash, start_seq
+        if start_seq < 0 or (start_seq == 0 and start_hash != GENESIS_HASH):
+            return result(False, f"the recorded verification head #{start_seq} does not describe this log", start_seq)
+        if start_seq > 0:
+            row = conn.execute("SELECT hash FROM audit_events WHERE seq = ?", (start_seq,)).fetchone()
+            if row is None:
+                return result(False, f"event #{start_seq}, the head at the last full verification, is missing"
+                                     " (events deleted)", start_seq)
+            if row["hash"] != start_hash:
+                return result(False, f"event #{start_seq} no longer carries the hash the last full verification"
+                                     " recorded (modified)", start_seq)
+    cur = conn.execute("SELECT * FROM audit_events WHERE seq > ? ORDER BY seq ASC", (after_seq,))
     while True:
         rows = cur.fetchmany(1000)
         if not rows:
@@ -208,10 +239,11 @@ def verify_chain(conn: sqlite3.Connection, checkpoint: dict[str, Any] | None = N
             if event["prev_hash"] != prev:
                 return result(False, "prev_hash does not match the preceding event", event["seq"])
             try:
-                hashed = compute_hash(event)
+                details_json = canonical_json(event["details"])
+                hashed = compute_hash(event, details_json)
                 # append_event stores details in canonical form, so any other text that parses
                 # to the same value (a duplicate key, say) was written by someone else.
-                canonical = row["details"] == canonical_json(event["details"]).decode("ascii")
+                canonical = row["details"] == details_json.decode("ascii")
             except (ValueError, TypeError, RecursionError):  # NaN, a BLOB, nesting too deep to encode
                 return result(False, "event content cannot be hashed (modified)", event["seq"])
             if hashed != event["hash"]:
@@ -325,16 +357,31 @@ def get_event(conn: sqlite3.Connection, seq: int) -> dict[str, Any] | None:
     return _row_to_event_lenient(row) if row else None
 
 
+def _distinct(conn: sqlite3.Connection, column: str) -> list[str]:
+    """Distinct values of an indexed column, ascending, by skip-scan: one index seek
+    per value (O(k log n)) instead of reading every row of the log."""
+    values: list[str] = []
+    row = conn.execute(f"SELECT MIN({column}) FROM audit_events").fetchone()
+    while row is not None and row[0] is not None:
+        values.append(row[0])
+        row = conn.execute(f"SELECT MIN({column}) FROM audit_events WHERE {column} > ?", (row[0],)).fetchone()
+    return values
+
+
 def facets(conn: sqlite3.Connection) -> dict[str, list[str]]:
-    def distinct(column: str) -> list[str]:
-        return [r[0] for r in conn.execute(f"SELECT DISTINCT {column} FROM audit_events ORDER BY {column}")]
+    # Every value actually present, not the vocabulary: a tampered row with an unknown
+    # outcome still shows up as a filter option.
+    return {"actions": _distinct(conn, "action"), "outcomes": _distinct(conn, "outcome"),
+            "actor_types": _distinct(conn, "actor_type")}
 
-    return {"actions": distinct("action"), "outcomes": distinct("outcome"), "actor_types": distinct("actor_type")}
 
-
-def export_jsonl(conn: sqlite3.Connection, fh: IO[str]) -> int:
-    """Write every event, oldest first, one canonical JSON object per line."""
-    count = 0
+def export(conn: sqlite3.Connection, fh: IO[str]) -> dict[str, Any]:
+    """Write every event, oldest first, one canonical JSON object per line. Returns
+    {"events", "head_seq", "head_hash"} describing exactly what was written: the head is
+    the last exported line, not whatever the log's head is by the time the caller asks."""
+    count, head_seq, head_hash = 0, 0, GENESIS_HASH
+    # One SELECT is one read snapshot, so the rows written and the head reported agree
+    # even while other connections keep appending.
     cur = conn.execute("SELECT * FROM audit_events ORDER BY seq ASC")
     while True:
         rows = cur.fetchmany(1000)
@@ -343,4 +390,10 @@ def export_jsonl(conn: sqlite3.Connection, fh: IO[str]) -> int:
         for row in rows:
             fh.write(canonical_json(_row_to_event_lenient(row)).decode("ascii") + "\n")
             count += 1
-    return count
+            head_seq, head_hash = row["seq"], row["hash"]
+    return {"events": count, "head_seq": head_seq, "head_hash": head_hash}
+
+
+def export_jsonl(conn: sqlite3.Connection, fh: IO[str]) -> int:
+    """Write every event, oldest first, one canonical JSON object per line; returns the count."""
+    return int(export(conn, fh)["events"])

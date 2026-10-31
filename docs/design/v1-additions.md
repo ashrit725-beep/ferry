@@ -8,8 +8,16 @@ These extend [v1-spec.md](v1-spec.md). They come from the research memos in
 Basis: docs/research/03 (MUST check #10, TUF rollback rule) and 01 (no movers
 reviewed offer it for models).
 
-- Versions compare by splitting on `.`, `-`, `+`; numeric parts compare
-  numerically, other parts lexicographically, numeric < non-numeric.
+- Versions compare semver-style. An optional leading `v` is ignored; the core
+  is dot-separated numbers compared numerically, trailing zero parts do not
+  count (`1.0` = `1.0.0`); a pre-release (`-rc.1`, or a letter suffix on the
+  last core part as in `1.0.0rc1`) sorts below its release, with numeric
+  identifiers below alphanumeric ones and digit runs compared as numbers
+  (`rc9` < `rc10`); build metadata after `+` is ignored. A version whose core
+  is not numbers (`latest`, `1.x`) cannot be ordered: `ferry pack` refuses it,
+  and verify and import fail it as `policy.rollback`, even with
+  `--allow-downgrade`. (Revised 2026-10-30: the earlier text-wise comparison
+  of non-numeric parts ranked `v10` below `v9`.)
 - On import of bundle (name N, version V, id B):
   - If any imported bundle named N has a version greater than V, reject with
     check `policy.rollback` ("1.2.0 of N is already imported; refusing to import

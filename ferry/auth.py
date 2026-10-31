@@ -25,9 +25,10 @@ import sqlite3
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Any, Callable
+from typing import Any
 
 from . import audit
 from .config import Settings
@@ -389,6 +390,13 @@ def hash_password(password: str, *, salt: bytes | None = None) -> str:
     return f"scrypt${SCRYPT_N}${SCRYPT_R}${SCRYPT_P}${_b64(salt)}${_b64(digest)}"
 
 
+# Each scrypt check allocates 128*r*N bytes (32 MiB at the defaults). A burst of
+# sign-in requests runs in the server's thread pool, so without a bound it could
+# hold the pool size times that at once; extra checks wait their turn instead.
+SCRYPT_CONCURRENCY = 4
+_SCRYPT_SLOTS = threading.BoundedSemaphore(SCRYPT_CONCURRENCY)
+
+
 def verify_password(password: object, stored: object) -> bool:
     """Constant-time check against a stored scrypt string. Malformed strings and
     parameters outside safe bounds (which could exhaust memory) verify as False."""
@@ -410,8 +418,9 @@ def verify_password(password: object, stored: object) -> bool:
     if not 8 <= len(salt) <= 64 or not 16 <= len(expected) <= 64:
         return False
     try:
-        actual = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=n, r=r, p=p, maxmem=SCRYPT_MAXMEM,
-                                dklen=len(expected))
+        with _SCRYPT_SLOTS:
+            actual = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=n, r=r, p=p, maxmem=SCRYPT_MAXMEM,
+                                    dklen=len(expected))
     except (ValueError, MemoryError):
         return False
     return hmac.compare_digest(actual, expected)
@@ -521,6 +530,9 @@ def create_session(conn: sqlite3.Connection, user_id: int, settings: Settings, *
         row = conn.execute("SELECT * FROM admin_users WHERE id = ?", (user_id,)).fetchone()
         if row is None or row["disabled"]:
             raise NotFound("console user does not exist or is disabled")
+        # Housekeeping in the same write: sessions whose browser never came back
+        # are otherwise kept forever (resolve_session only deletes a presented token).
+        _purge_expired(conn, settings, now)
         conn.execute("INSERT INTO sessions (token_hash, user_id, created_at, last_seen_at, expires_at)"
                      " VALUES (?, ?, ?, ?, ?)", (sha256_hex(token.encode("ascii")), user_id, stamp, stamp, expires_at))
         conn.execute("UPDATE admin_users SET last_login_at = ? WHERE id = ?", (stamp, user_id))
@@ -598,9 +610,18 @@ def delete_session(conn: sqlite3.Connection, token: object, *, client_ip: str | 
 def purge_expired_sessions(conn: sqlite3.Connection, settings: Settings, *, now: _dt.datetime | None = None) -> int:
     """Delete sessions past their absolute or idle limit. Housekeeping, not audited."""
     now = now or utc_now()
-    idle_cutoff = rfc3339(now - _dt.timedelta(minutes=settings.server.session_idle_minutes))
     with write_tx(conn):
-        cur = conn.execute("DELETE FROM sessions WHERE expires_at <= ? OR last_seen_at <= ?", (rfc3339(now), idle_cutoff))
+        return _purge_expired(conn, settings, now)
+
+
+def _purge_expired(conn: sqlite3.Connection, settings: Settings, now: _dt.datetime) -> int:
+    # The same limits resolve_session applies: the stored absolute expiry, the
+    # absolute limit under the current settings, and the idle limit. Stamps are
+    # fixed-width UTC RFC 3339, so string order is time order.
+    idle_cutoff = rfc3339(now - _dt.timedelta(minutes=settings.server.session_idle_minutes))
+    created_cutoff = rfc3339(now - _dt.timedelta(hours=settings.server.session_max_hours))
+    cur = conn.execute("DELETE FROM sessions WHERE expires_at <= ? OR last_seen_at <= ? OR created_at <= ?",
+                       (rfc3339(now), idle_cutoff, created_cutoff))
     return cur.rowcount
 
 
@@ -611,20 +632,38 @@ def purge_expired_sessions(conn: sqlite3.Connection, settings: Settings, *, now:
 class _Bucket:
     failures: deque[float] = field(default_factory=deque)
     locked_until: float = 0.0
+    in_flight: int = 0
+    """Attempts admitted by begin() whose password check has not finished yet."""
+
+
+@dataclass(frozen=True)
+class ThrottleRefusal:
+    """Why begin() refused an attempt: `busy` when the limit is taken up by
+    attempts still being checked rather than by a lock."""
+
+    retry_after_s: int
+    busy: bool = False
 
 
 class LoginThrottle:
     """In-memory brake on password guessing: too many failures for one username
     (5) or from one client address (20) within the window lock further attempts
-    for `lock_s`. State is per process and resets on restart."""
+    for `lock_s`. State is per process and resets on restart.
+
+    Callers admit an attempt with begin() before checking the password and report
+    the outcome with finish(). Admission and the count are one step under the
+    lock, and attempts still in flight count toward the limit, so a concurrent
+    burst cannot get more password checks than the limit allows."""
 
     def __init__(self, *, max_user_failures: int = 5, max_ip_failures: int = 20, window_s: float = 900.0,
-                 lock_s: float = 900.0, clock: Callable[[], float] = time.monotonic, max_entries: int = 10_000):
+                 lock_s: float = 900.0, clock: Callable[[], float] = time.monotonic, max_entries: int = 10_000,
+                 busy_retry_s: int = 2):
         self.max_user_failures = max_user_failures
         self.max_ip_failures = max_ip_failures
         self.window_s = window_s
         self.lock_s = lock_s
         self.max_entries = max_entries
+        self.busy_retry_s = busy_retry_s
         self._clock = clock
         self._lock = threading.Lock()
         self._buckets: dict[tuple[str, str], _Bucket] = {}
@@ -639,6 +678,10 @@ class LoginThrottle:
     def _limit(self, key: tuple[str, str]) -> int:
         return self.max_user_failures if key[0] == "user" else self.max_ip_failures
 
+    def _expire(self, bucket: _Bucket, now: float) -> None:
+        while bucket.failures and bucket.failures[0] <= now - self.window_s:
+            bucket.failures.popleft()
+
     def retry_after(self, username: object, client_ip: str | None = None) -> int | None:
         """Seconds until a locked username or address may try again, or None."""
         now = self._clock()
@@ -647,36 +690,88 @@ class LoginThrottle:
                      if (b := self._buckets.get(key)) is not None and b.locked_until > now]
         return math.ceil(max(waits)) if waits else None
 
+    def begin(self, username: object, client_ip: str | None = None) -> ThrottleRefusal | None:
+        """Admit one password check, or refuse it. Refused when the username or
+        address is locked, or when its failures plus the checks already in flight
+        have reached the limit. An admitted attempt must be closed with finish()."""
+        now = self._clock()
+        keys = self._keys(username, client_ip)
+        with self._lock:
+            waits = [b.locked_until - now for key in keys
+                     if (b := self._buckets.get(key)) is not None and b.locked_until > now]
+            if waits:
+                return ThrottleRefusal(math.ceil(max(waits)))
+            for key in keys:
+                bucket = self._buckets.get(key)
+                if bucket is None:
+                    continue
+                self._expire(bucket, now)
+                if len(bucket.failures) + bucket.in_flight >= self._limit(key):
+                    return ThrottleRefusal(self.busy_retry_s, busy=True)
+            for key in keys:
+                self._buckets.setdefault(key, _Bucket()).in_flight += 1
+            if len(self._buckets) > self.max_entries:
+                self._prune(now)
+        return None
+
+    def finish(self, username: object, client_ip: str | None = None, *, ok: bool) -> int | None:
+        """Close an attempt admitted by begin(): a failure is counted (returning the
+        lock duration if it caused or met a lock); a success clears the username."""
+        now = self._clock()
+        with self._lock:
+            for key in self._keys(username, client_ip):
+                bucket = self._buckets.get(key)
+                if bucket is not None and bucket.in_flight > 0:
+                    bucket.in_flight -= 1
+            if ok:
+                self._clear_user(username)
+                return None
+            return self._count_failure(username, client_ip, now)
+
     def record_failure(self, username: object, client_ip: str | None = None) -> int | None:
         """Count a failure; returns the lock duration if this failure caused (or met) a lock."""
         now = self._clock()
-        waits: list[float] = []
         with self._lock:
-            for key in self._keys(username, client_ip):
-                bucket = self._buckets.setdefault(key, _Bucket())
-                if bucket.locked_until > now:
-                    waits.append(bucket.locked_until - now)
-                    continue
-                while bucket.failures and bucket.failures[0] <= now - self.window_s:
-                    bucket.failures.popleft()
-                bucket.failures.append(now)
-                if len(bucket.failures) >= self._limit(key):
-                    bucket.locked_until = now + self.lock_s
-                    bucket.failures.clear()
-                    waits.append(self.lock_s)
-            if len(self._buckets) > self.max_entries:
-                self._prune(now)
-        return math.ceil(max(waits)) if waits else None
+            return self._count_failure(username, client_ip, now)
 
     def record_success(self, username: object, client_ip: str | None = None) -> None:
         """A successful login clears the username's failures (not the address's)."""
         with self._lock:
-            self._buckets.pop(self._keys(username, None)[0], None)
+            self._clear_user(username)
+
+    def _clear_user(self, username: object) -> None:
+        key = self._keys(username, None)[0]
+        bucket = self._buckets.get(key)
+        if bucket is None:
+            return
+        if bucket.in_flight:  # other checks for this name are still running
+            bucket.failures.clear()
+            bucket.locked_until = 0.0
+        else:
+            del self._buckets[key]
+
+    def _count_failure(self, username: object, client_ip: str | None, now: float) -> int | None:
+        waits: list[float] = []
+        for key in self._keys(username, client_ip):
+            bucket = self._buckets.setdefault(key, _Bucket())
+            if bucket.locked_until > now:
+                waits.append(bucket.locked_until - now)
+                continue
+            self._expire(bucket, now)
+            bucket.failures.append(now)
+            if len(bucket.failures) >= self._limit(key):
+                bucket.locked_until = now + self.lock_s
+                bucket.failures.clear()
+                waits.append(self.lock_s)
+        if len(self._buckets) > self.max_entries:
+            self._prune(now)
+        return math.ceil(max(waits)) if waits else None
 
     def _prune(self, now: float) -> None:
         # Only idle entries are dropped, so flooding the table with fresh names
         # cannot evict an active lock.
         stale = [k for k, b in self._buckets.items()
-                 if b.locked_until <= now and (not b.failures or b.failures[-1] <= now - self.window_s)]
+                 if b.locked_until <= now and not b.in_flight
+                 and (not b.failures or b.failures[-1] <= now - self.window_s)]
         for key in stale:
             del self._buckets[key]

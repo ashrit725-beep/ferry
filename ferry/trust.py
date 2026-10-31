@@ -7,8 +7,9 @@ caller (CLI) records the `trust.add` / `trust.revoke` audit events.
 Loading fails closed. An entry is ignored, and reported in `problems`, when its
 file name, its `key_id` and the id computed from its PEM disagree, when it does
 not parse or has unknown keys, when it is a symlink or not a regular file, or
-when it (or the directory) is writable by group or others, since anyone who
-can write the store can make Ferry trust any key.
+when it (or the directory) is writable by group or others, or when it (or the
+directory) is owned by anyone but the user Ferry runs as or root, since anyone
+who can write the store can make Ferry trust any key.
 
 Key status at a time `now`: revoked > not_yet_valid > expired > active. A
 revoked key's signatures never count, whatever time they claim: a manifest's
@@ -47,6 +48,27 @@ MAX_REASON_CHARS = 500
 _REQUIRED = frozenset({"key_id", "name", "roles", "public_key_pem"})
 _OPTIONAL = frozenset({"not_before", "not_after", "revoked_at", "revocation_reason", "added_at", "comment"})
 _O_READ = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+_O_DIR = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+_DIR_FD = os.open in os.supports_dir_fd and os.scandir in os.supports_fd
+
+
+def _owner_problem(st: os.stat_result) -> str | None:
+    """Why `st` is not owned by the user Ferry runs as or root (like ssh StrictModes), or None."""
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is None:
+        return None
+    euid = geteuid()
+    if st.st_uid in (0, euid):
+        return None
+    return f"owned by uid {st.st_uid}, not by the user Ferry runs as ({_user_name(euid)}) or root"
+
+
+def _user_name(uid: int) -> str:
+    try:
+        import pwd
+        return pwd.getpwuid(uid).pw_name
+    except (ImportError, KeyError):
+        return str(uid)
 
 
 @dataclass(frozen=True)
@@ -192,18 +214,21 @@ def _entry_from_doc(stem: str, doc: Any) -> TrustEntry:
     )
 
 
-def _read_entry(directory: Path, name: str) -> TrustEntry:
+def _read_entry(directory: Path, name: str, dir_fd: int | None = None) -> TrustEntry:
     stem = name[: -len(".json")]
     if not crypto.KEY_ID.fullmatch(stem):
         raise _Skip("file name is not <64 lowercase hex key id>.json")
     try:
-        fd = os.open(directory / name, _O_READ)
+        fd = os.open(name, _O_READ, dir_fd=dir_fd) if dir_fd is not None else os.open(directory / name, _O_READ)
     except OSError as exc:
         raise _Skip(f"cannot be opened ({exc.strerror}); symbolic links are not followed") from None
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
             raise _Skip("not a regular file")
+        owner = _owner_problem(st)
+        if owner:
+            raise _Skip(f"{owner}; fix it with: chown {_user_name(os.geteuid())} {directory / name}")
         if st.st_mode & 0o022:
             raise _Skip("writable by group or others")
         if st.st_size > MAX_ENTRY_BYTES:
@@ -228,16 +253,35 @@ def load_trust_store(directory: str | Path) -> TrustStore:
     except OSError as exc:
         return TrustStore(path, [], [f"cannot read trust directory {path}: {exc.strerror}; no keys are trusted"])
     if not stat.S_ISDIR(st.st_mode):
-        return TrustStore(path, [], [f"trust directory {path} is not a directory (symbolic links are not followed); "
-                                     "no keys are trusted"])
+        return TrustStore(path, [], [(f"trust directory {path} is not a directory (symbolic links are not followed); "
+                                      "no keys are trusted")])
+    try:
+        dir_fd = os.open(path, _O_DIR)
+    except OSError as exc:
+        return TrustStore(path, [], [f"cannot open trust directory {path}: {exc.strerror}; no keys are trusted"])
+    try:
+        return _load_from_fd(path, st, dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def _load_from_fd(path: Path, lst: os.stat_result, dir_fd: int) -> TrustStore:
+    st = os.fstat(dir_fd)
+    if not stat.S_ISDIR(st.st_mode) or (st.st_dev, st.st_ino) != (lst.st_dev, lst.st_ino):
+        return TrustStore(path, [], [(f"trust directory {path} changed while it was being opened; no keys are trusted "
+                                      "(run the command again)")])
+    owner = _owner_problem(st)
+    if owner:
+        return TrustStore(path, [], [(f"trust directory {path} is {owner}; no keys are trusted until that is fixed "
+                                      f"(chown {_user_name(os.geteuid())} {path})")])
     if st.st_mode & 0o022:
-        return TrustStore(path, [], [f"trust directory {path} is writable by group or others; no keys are trusted "
-                                     f"until that is fixed (chmod go-w {path})"])
+        return TrustStore(path, [], [(f"trust directory {path} is writable by group or others; no keys are trusted "
+                                      f"until that is fixed (chmod go-w {path})")])
     entries: list[TrustEntry] = []
     problems: list[str] = []
     ignored: dict[str, str] = {}
     try:
-        names = sorted(e.name for e in os.scandir(path))
+        names = sorted(e.name for e in os.scandir(dir_fd if _DIR_FD else path))
     except OSError as exc:
         return TrustStore(path, [], [f"cannot list trust directory {path}: {exc.strerror}; no keys are trusted"])
     for name in names:
@@ -247,7 +291,7 @@ def load_trust_store(directory: str | Path) -> TrustStore:
             problems.append(f"unexpected file {quote_untrusted(name)} in the trust directory (ignored)")
             continue
         try:
-            entries.append(_read_entry(path, name))
+            entries.append(_read_entry(path, name, dir_fd if _DIR_FD else None))
         except _Skip as exc:
             problems.append(f"trust entry {quote_untrusted(name)} ignored: {exc}")
             stem = name[: -len(".json")]

@@ -146,24 +146,35 @@ def _json(text: str | None, default: Any) -> Any:
 # --- auth -------------------------------------------------------------------------
 
 
-def _throttled(wait: int) -> ApiError:
-    return ApiError(429, "too_many_attempts", f"Too many failed sign-in attempts. Try again in {wait} seconds.",
+def _throttled(refusal: auth.ThrottleRefusal) -> ApiError:
+    wait = refusal.retry_after_s
+    if refusal.busy:
+        message = (f"Too many sign-in attempts are being checked for this account or address. "
+                   f"Try again in {wait} seconds.")
+    else:
+        message = f"Too many failed sign-in attempts. Try again in {wait} seconds."
+    return ApiError(429, "too_many_attempts", message,
                     details={"retry_after_s": wait}, headers={"Retry-After": str(wait)}, extra={"retry_after_s": wait})
 
 
 def _login(state: GatewayState, throttle: auth.LoginThrottle, username: str, password: str, ip: str | None,
            rid: str) -> tuple[str, dict[str, Any]]:
     with state.db.session() as conn:
-        wait = throttle.retry_after(username, ip)
-        if wait is not None:
+        # begin() admits and counts the attempt in one step, so a concurrent burst
+        # cannot all pass the check before any of them is recorded as a failure.
+        refusal = throttle.begin(username, ip)
+        if refusal is not None:
             auth.record_login_failure(conn, username, "throttled", client_ip=ip, correlation_id=rid, throttled=True)
-            raise _throttled(wait)
-        result = auth.authenticate_admin(conn, username, password)
-        if not result.ok or result.user is None:
-            throttle.record_failure(username, ip)
+            raise _throttled(refusal)
+        ok = False
+        try:
+            result = auth.authenticate_admin(conn, username, password)
+            ok = result.ok and result.user is not None
+        finally:
+            throttle.finish(username, ip, ok=ok)
+        if not ok or result.user is None:
             auth.record_login_failure(conn, username, result.reason or "failure", client_ip=ip, correlation_id=rid)
             raise ApiError(401, "invalid_credentials", "Wrong username or password.")
-        throttle.record_success(username, ip)
         try:
             return auth.create_session(conn, int(result.user["id"]), state.settings, client_ip=ip, correlation_id=rid)
         except NotFound:  # disabled between the password check and the session
@@ -546,7 +557,7 @@ async def check_backend(request: Request, backend_id: RowId, user: SessionUser =
 @router.get("/routes")
 def list_routes(request: Request, user: SessionUser = Depends(any_role)) -> dict[str, Any]:
     with _db(request) as conn:
-        return {"items": backends.list_routes(conn)}
+        return {"items": backends.list_routes(conn, max_age_s=backends.status_max_age_s(_state(request).settings))}
 
 
 @router.post("/routes", status_code=201)
@@ -751,12 +762,10 @@ def export_audit(request: Request, user: SessionUser = Depends(any_role)) -> Res
     spool = tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024)
     try:
         with _db(request) as conn:
-            count = audit.export_jsonl(conn, _AsciiSink(spool))  # type: ignore[arg-type]
-            head = audit.head(conn)
+            written = audit.export(conn, _AsciiSink(spool))  # type: ignore[arg-type]
             audit.append_event(conn, actor_type="admin", actor_id=user.username, action="audit.export",
                                resource="audit", outcome="success", correlation_id=_rid(request),
-                               details={"events": count, "head_seq": head["seq"], "head_hash": head["hash"],
-                                        "via": "api"})
+                               details={**written, "via": "api"})
         spool.seek(0)
     except BaseException:
         spool.close()
@@ -896,8 +905,13 @@ def _last_verify(conn: sqlite3.Connection) -> dict[str, Any] | None:
     events = audit.query_events(conn, action="audit.verify", limit=1)
     if not events:
         return None
-    details = events[0]["details"]
-    return {"ok": bool(details.get("ok")), "verified_at": events[0]["ts"], "problem": details.get("problem")}
+    event = events[0]
+    details = event["details"]
+    head_seq = details.get("head_seq")
+    # head_seq is the last event the check covered; the check's own event (seq) is appended after it.
+    return {"ok": bool(details.get("ok")), "verified_at": event["ts"], "problem": details.get("problem"),
+            "head_seq": head_seq if isinstance(head_seq, int) and not isinstance(head_seq, bool) else None,
+            "seq": event["seq"]}
 
 
 def build_overview(state: GatewayState, conn: sqlite3.Connection) -> dict[str, Any]:

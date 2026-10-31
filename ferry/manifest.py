@@ -38,6 +38,62 @@ FERRY_VERSION = re.compile(r"[0-9]+(\.[0-9]+){0,2}")
 SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 RFC3339 = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,9})?(Z|[+-][0-9]{2}:[0-9]{2})")
 MAX_DESCRIPTION_CHARS = 2000
+
+
+# ---- version ordering (rollback protection, v1-additions A1) ----
+# It lives here because it defines which bundle versions are valid: `ferry pack`
+# refuses an unorderable version on the connected side, and the importer refuses
+# one at verify and import (check policy.rollback).
+
+class UnorderableVersion(ValueError):
+    """A bundle version that rollback protection cannot place in order."""
+
+
+# A core part is digits; the last one may carry a PEP 440 style pre-release
+# suffix that starts with a letter ("0rc1", "0a2").
+_CORE_PART = re.compile(r"([0-9]+)([A-Za-z][A-Za-z0-9]*)?")
+_RUNS = re.compile(r"[0-9]+|[^0-9]+")
+VERSION_FORM = ("MAJOR.MINOR.PATCH with an optional leading 'v', '-pre-release' and '+build'"
+                " (for example 1.2.0, v1.2.0, 1.2.0-rc.1 or 1.2.0rc1)")
+
+
+def _pre_ident(part: str) -> tuple[Any, ...]:
+    """A pre-release identifier: numeric ones rank below alphanumeric ones (as in
+    semver), and digit runs inside an alphanumeric one compare numerically, so
+    rc9 < rc10."""
+    runs = tuple((0, int(r), "") if r.isdigit() else (1, 0, r) for r in _RUNS.findall(part))
+    return (0 if part.isdigit() else 1, runs)
+
+
+def version_key(version: str) -> tuple[Any, ...]:
+    """Order bundle versions semver-style: an optional leading 'v' is ignored, core
+    parts compare numerically (trailing zero parts do not count, so 1.0 == 1.0.0),
+    a pre-release ('-rc.1', or a letter suffix on the last core part as in
+    '1.0.0rc1') sorts below its release, and build metadata (after '+') is ignored.
+
+    Raises UnorderableVersion when the core is not dot-separated digits: such a
+    version cannot be compared, and comparing it as text would rank 'v10' below
+    'v9' or 'latest' above every release."""
+    main = version.split("+", 1)[0]
+    if main[:1] in ("v", "V") and main[1:2].isdigit():
+        main = main[1:]
+    core, dash, pre = main.partition("-")
+    parts = core.split(".")
+    numbers: list[int] = []
+    suffix = ""
+    for i, part in enumerate(parts):
+        m = _CORE_PART.fullmatch(part)
+        if m is None or (m.group(2) and i != len(parts) - 1):
+            raise UnorderableVersion(
+                f"version {version!r} cannot be ordered for rollback protection: {part!r} is not a number;"
+                f" publish versions as {VERSION_FORM}")
+        numbers.append(int(m.group(1)))
+        suffix = m.group(2) or ""
+    while numbers and numbers[-1] == 0:
+        numbers.pop()
+    pre_ids = ([suffix] if suffix else []) + (pre.split(".") if dash else [])
+    pre_key: tuple[Any, ...] = (0, *[_pre_ident(p) for p in pre_ids]) if pre_ids else (1,)
+    return (tuple(numbers), pre_key)
 MAX_ERRORS = 50
 
 _TOP = {"schema", "bundle", "producer", "requires", "artifacts"}
@@ -192,13 +248,15 @@ class _Errors:
         self.add(path, f"{shown} is not {what}")
         return False
 
-    def integer(self, path: str, value: Any, low: int, high: int | None, *, nullable: bool = False) -> None:
+    def integer(self, path: str, value: Any, low: int, high: int | None, *, nullable: bool = False,
+                setting: str = "") -> None:
         if value is None and nullable:
             return
         if not isinstance(value, int) or isinstance(value, bool):
             self.add(path, "must be an integer" + (" or null" if nullable else ""))
         elif value < low or (high is not None and value > high):
-            self.add(path, f"must be between {low} and {high}" if high is not None else f"must be at least {low}")
+            bound = f"must be between {low} and {high}" if high is not None else f"must be at least {low}"
+            self.add(path, f"{bound} ({setting})" if setting and high is not None and value > high else bound)
 
 
 def _check_timestamp(v: _Errors, path: str, value: Any) -> None:
@@ -256,7 +314,8 @@ def _validate_artifacts(v: _Errors, artifacts: Any, limits: ImportSettings) -> N
         v.add("artifacts", "must be a list")
         return
     if not 1 <= len(artifacts) <= limits.max_artifacts:
-        v.add("artifacts", f"must list between 1 and {limits.max_artifacts} artifacts (found {len(artifacts)})")
+        over = " ([import].max_artifacts)" if len(artifacts) > limits.max_artifacts else ""
+        v.add("artifacts", f"must list between 1 and {limits.max_artifacts} artifacts (found {len(artifacts)}){over}")
         if len(artifacts) > limits.max_artifacts:
             return
     seen: dict[str, int] = {}
@@ -276,7 +335,7 @@ def _validate_artifacts(v: _Errors, artifacts: Any, limits: ImportSettings) -> N
             seen.setdefault(path, i)
             folded.setdefault(path.lower(), i)
         if "size" in art:
-            v.integer(f"{where}.size", art["size"], 0, limits.max_artifact_bytes)
+            v.integer(f"{where}.size", art["size"], 0, limits.max_artifact_bytes, setting="[import].max_artifact_bytes")
         if "sha256" in art:
             v.pattern(f"{where}.sha256", art["sha256"], SHA256_HEX, "64 lowercase hex characters")
         kind = art.get("kind")

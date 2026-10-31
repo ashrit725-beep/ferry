@@ -43,7 +43,7 @@ GGUF_MAX_ARRAY = 16_000_000
 GGUF_MAX_ARRAY_DEPTH = 2
 GGUF_MAX_DIMS = 4
 GGUF_MAX_GGML_TYPE = 64
-GGUF_MAX_TENSOR_NAME = 64
+GGUF_MAX_TENSOR_NAME = 63  # llama.cpp: GGML_MAX_NAME is 64 bytes including the terminating NUL
 GGUF_MAX_HEADER = 256 * MiB
 GGUF_DEFAULT_ALIGNMENT = 32
 GGUF_MAX_ALIGNMENT = MiB
@@ -319,7 +319,8 @@ def _parse_gguf(fh: IO[bytes], size: int, meta: dict[str, Any], warnings: list[s
         if n == 0:
             raise _Malformed(f"tensor {index} has an empty name")
         if n > GGUF_MAX_TENSOR_NAME:
-            raise _Malformed(f"tensor {index} name is {n:,} bytes; the limit is {GGUF_MAX_TENSOR_NAME}")
+            raise _Malformed(f"tensor {index} name is {n:,} bytes; the limit is {GGUF_MAX_TENSOR_NAME} "
+                             f"(llama.cpp refuses longer names), so re-export the model with shorter tensor names")
         try:
             tname = r.take(n, f"name of tensor {index}").decode("utf-8")
         except UnicodeDecodeError:
@@ -442,7 +443,8 @@ def _gguf_int(kept: dict[str, tuple[int, Any]], key: str) -> int | None:
 def _check_tensor_data(tensors: list[tuple[int, int, int, str, int]], alignment: int, data_size: int,
                        warnings: list[str]) -> None:
     """Offsets aligned and inside the data region; for known ggml types, byte
-    sizes computed with exact integer arithmetic must fit and must not overlap."""
+    sizes computed with exact integer arithmetic must fit, must not overlap and,
+    as llama.cpp requires, must be stored back to back in declaration order."""
     spans: list[tuple[int, int, str]] = []
     unknown: set[int] = set()
     for offset, ggml_type, elements, tname, first_dim in tensors:
@@ -464,6 +466,7 @@ def _check_tensor_data(tensors: list[tuple[int, int, int, str, int]], alignment:
             raise _Malformed(f"tensor {quote_untrusted(tname)} needs {nbytes:,} bytes at offset {offset:,}, "
                              f"past the end of the file")
         spans.append((offset, offset + nbytes, tname))
+    declared = list(spans)
     spans.sort()
     for (_, end, first), (start, _, second) in zip(spans, spans[1:]):
         if start < end:
@@ -472,11 +475,16 @@ def _check_tensor_data(tensors: list[tuple[int, int, int, str, int]], alignment:
         ids = ", ".join(str(t) for t in sorted(unknown))
         warnings.append(f"ggml type(s) {ids} are not known to Ferry; the byte sizes of those tensors were not checked")
         return
-    unused, cursor = 0, 0
-    for start, end, _ in spans:
-        unused += max(start - _align(cursor, alignment), 0)
-        cursor = end
-    unused += max(data_size - _align(cursor, alignment), 0)
+    # llama.cpp loads tensor i only at the padded sum of the sizes of tensors 0..i-1,
+    # so a gap or a reordering fails at serve time and a gap can carry other bytes.
+    cursor = 0
+    for start, end, tname in declared:
+        if start != cursor:
+            raise _Malformed(f"tensor {quote_untrusted(tname)} is at offset {start:,}, but the tensors declared before it "
+                             f"end at {cursor:,}; llama.cpp only loads tensors stored back to back in declaration order, "
+                             f"so re-export the model with a standard GGUF writer")
+        cursor = _align(end, alignment)
+    unused = max(data_size - cursor, 0)
     if unused:
         warnings.append(f"{unused:,} bytes of the tensor data region are not used by any tensor")
 
@@ -620,11 +628,39 @@ def _raw_pickle(head: bytes) -> bool:
     return len(head) >= 2 and head[0] == 0x80 and 2 <= head[1] <= 5
 
 
+def _tar_checksum_ok(head: bytes) -> bool:
+    """A tar header without the ustar magic (v7 tar), recognised as tarfile does:
+    a non-empty name and an octal checksum at offset 148 that matches the header
+    bytes summed with the checksum field read as spaces (unsigned or signed)."""
+    if len(head) < 512 or head[0] == 0:
+        return False
+    field = head[148:156].replace(b"\x00", b" ").strip()
+    if not field or any(c not in b"01234567" for c in field):
+        return False
+    stored = int(field, 8)
+    block = head[:148] + b" " * 8 + head[156:512]
+    unsigned = sum(block)
+    signed = sum(b - 256 if b > 127 else b for b in block)
+    return stored in (unsigned, signed)
+
+
 def _archive_magic(head: bytes) -> str | None:
     if head[:2] == b"\x1f\x8b":
         return "gzip"
-    if head[257:262] == b"ustar":
+    if head[257:262] == b"ustar" or _tar_checksum_ok(head):
         return "tar"
+    if head[:8] == b"!<arch>\n":
+        return "ar"
+    if head[:6] in (b"070701", b"070702", b"070707") or head[:2] in (b"\xc7\x71", b"\x71\xc7"):
+        return "cpio"
+    if head[:2] == b"\x1f\x9d":
+        return "compress"
+    if head[:4] == b"LZIP":
+        return "lzip"
+    if head[:4] == b"MSCF":
+        return "cab"
+    if head[:4] == b"xar!":
+        return "xar"
     if head[:6] == b"\xfd7zXZ\x00":
         return "xz"
     if head[:4] == b"\x28\xb5\x2f\xfd":
@@ -852,7 +888,12 @@ def detect_format(fileobj: IO[bytes], size: int, name: str = "") -> FormatInfo:
     probe = _probe_zip(fileobj, size, head)
 
     if head[:4] == GGUF_MAGIC:
-        return _with_polyglot_checks(parse_gguf(fileobj, size), probe)
+        gguf = parse_gguf(fileobj, size)
+        # 'G' is also a pickle opcode (BINFLOAT): a GGUF header can be laid out so
+        # that an unpickler reading from byte 0 walks into a metadata key and imports.
+        if gguf.ok and _headerless_pickle(fileobj, size):
+            return FormatInfo("pickle", {"container": "raw", "header": "none", "polyglot": "gguf"})
+        return _with_polyglot_checks(gguf, probe)
 
     safetensors: FormatInfo | None = None
     if _safetensors_shaped(head) or base.endswith(".safetensors"):

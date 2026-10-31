@@ -27,13 +27,17 @@ import dataclasses
 import datetime as _dt
 import getpass
 import json
+import os
 import re
 import secrets
 import shutil
+import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +45,7 @@ from . import __version__
 from .config import ImportSettings, Settings
 from .db import Database
 from .preflight import collect_macos_denials, describe_attempts, egress_label
+from .rehearse_runner import PGID_MARKER
 from .sandbox import detect_isolation
 from .util import rfc3339
 
@@ -49,6 +54,15 @@ DEFAULT_PROMPT = "Reply with one word: ready"
 # llama.cpp fixed CVE-2026-27940, a GGUF loader overflow, in build b8146 (docs/research/03).
 MIN_LLAMACPP_BUILD = 8146
 _BUILD = re.compile(r"build\s+(\d+)")
+_PGID_LINE = re.compile(rf"^{re.escape(PGID_MARKER)} (\d+)$", re.MULTILINE)
+
+# The runner's own time limits per model (ferry.rehearse_runner). The outer timeout is derived from them, so it
+# never fires while the runner is still inside one of its budgets.
+PROPS_TIMEOUT_S = 30.0
+REQUEST_TIMEOUT_S = 120.0
+STOP_GRACE_S = 10.0
+# After SIGTERM, the time the runner gets to stop its runtime (STOP_GRACE_S, the final wait and a process listing).
+RUNNER_GRACE_S = STOP_GRACE_S + 20.0
 
 
 def _as_dict(obj: Any) -> dict[str, Any]:
@@ -86,6 +100,72 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
+def runner_budget_s(n_models: int, load_timeout_s: float) -> float:
+    """Upper bound on the runner's run time: per model the load timeout, the /props and chat request timeouts and
+    the stop grace period, plus slack for health polls and process listings; plus the egress probe and start-up."""
+    per_model = load_timeout_s + PROPS_TIMEOUT_S + REQUEST_TIMEOUT_S + STOP_GRACE_S + 30.0
+    return 60.0 + n_models * per_model
+
+
+def _signal_group(pgid: int, sig: int) -> bool:
+    """Send `sig` to a process group; False once no process is left in it."""
+    try:
+        os.killpg(pgid, sig)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
+def _stop_runner(proc: subprocess.Popen) -> tuple[str, str]:
+    """SIGTERM to the runner's process group, so that the runner stops its runtime before it exits (a SIGKILL
+    would skip that and leave llama-server running in its own session); SIGKILL after RUNNER_GRACE_S."""
+    _signal_group(proc.pid, signal.SIGTERM)
+    try:
+        return proc.communicate(timeout=RUNNER_GRACE_S)
+    except subprocess.TimeoutExpired:
+        _signal_group(proc.pid, signal.SIGKILL)
+        return proc.communicate()
+
+
+def _kill_runtime_groups(stderr: str) -> list[int]:
+    """Last resort after an abnormal runner exit: SIGKILL every runtime process group the runner announced.
+    Returns the groups still alive a few seconds later."""
+    pgids = [int(m) for m in _PGID_LINE.findall(stderr or "")]
+    alive = [g for g in pgids if _signal_group(g, signal.SIGKILL)]
+    deadline = time.monotonic() + 5
+    while alive and time.monotonic() < deadline:
+        time.sleep(0.05)
+        alive = [g for g in alive if _signal_group(g, 0)]
+    return alive
+
+
+def _run_runner(command: list[str], timeout_s: float) -> tuple[int | None, str, str]:
+    """Run the sandboxed runner: (exit code, or None after a timeout; stdout; stderr). After a timeout or a
+    failed exit, no runtime it started is left running, or its process group is named in the stderr returned."""
+    # Own session, so the SIGTERM reaches the runner behind a wrapper that forks (bwrap) and nothing else.
+    proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, start_new_session=True)
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout_s)
+        code: int | None = proc.returncode
+    except subprocess.TimeoutExpired:
+        stdout, stderr = _stop_runner(proc)
+        code = None
+    except BaseException:  # e.g. Ctrl-C, which the runner in its own session does not receive
+        _, stderr = _stop_runner(proc)
+        _kill_runtime_groups(stderr)
+        raise
+    if code != 0:
+        alive = _kill_runtime_groups(stderr)
+        if alive:
+            groups = " ".join(f"-{g}" for g in alive)
+            stderr += (f"\nthe runtime's process group(s) {', '.join(map(str, alive))} could not be stopped;"
+                       f" stop them with: kill -KILL {groups}")
+    return code, stdout, _PGID_LINE.sub("", stderr or "").strip()
+
+
 def _imported_models(settings: Settings, database: Database, bundle_id: str) -> list[dict[str, Any]]:
     from .bundle import store
 
@@ -115,6 +195,7 @@ def rehearse(
     min_build: int | None = MIN_LLAMACPP_BUILD,
     require_isolation: bool = True,
     load_timeout_s: float = 180.0,
+    progress: Callable[[int, int], None] | None = None,
 ) -> dict[str, Any]:
     """Run the rehearsal and return the report (see docs/design/v1-additions.md, A2)."""
     from .bundle.importer import import_bundle
@@ -151,7 +232,8 @@ def rehearse(
         database.init()
 
         # 1. Same verification and import path as the disconnected side.
-        result = _as_dict(import_bundle(settings, database, Path(bundle), actor_type="cli", actor_id=_actor()))
+        result = _as_dict(import_bundle(settings, database, Path(bundle), actor_type="cli", actor_id=_actor(),
+                                        progress=progress))
         verification = _as_dict(result.get("report", result))
         report["bundle_id"] = verification.get("bundle_id")
         report["verification_verdict"] = verification.get("verdict")
@@ -202,21 +284,25 @@ def rehearse(
         runner_args = {
             "binary": binary, "token_file": str(token_file), "log_dir": str(log_dir), "prompt": prompt,
             "max_tokens": max_tokens, "ctx_size": ctx_size, "load_timeout_s": load_timeout_s,
+            "props_timeout_s": PROPS_TIMEOUT_S, "request_timeout_s": REQUEST_TIMEOUT_S, "stop_grace_s": STOP_GRACE_S,
             "models": [{**m, "port": _free_port()} for m in models], "strace": strace,
         }
         command = isolation.wrap([sys.executable, "-I", "-m", "ferry.rehearse_runner", json.dumps(runner_args)])
         # Local time with one second of slack: `log show --start` takes local time.
         log_start = (_dt.datetime.now() - _dt.timedelta(seconds=1)).strftime("%Y-%m-%d %H:%M:%S")
-        try:
-            proc = subprocess.run(command, capture_output=True, text=True,
-                                  timeout=load_timeout_s * len(models) + 300)
-        except subprocess.TimeoutExpired:
-            report["failures"].append("the rehearsal runner timed out")
+        budget = runner_budget_s(len(models), load_timeout_s)
+        code, stdout, stderr = _run_runner(command, budget)
+        if code is None:
+            detail = f": {stderr[-500:]}" if stderr else ""
+            report["failures"].append(
+                f"the rehearsal runner did not finish within {budget:.0f} s and was stopped, with the runtime it had"
+                f" started; check that llama-server loads each model within {load_timeout_s:.0f} s on this machine"
+                f"{detail}")
             return finish()
-        if proc.returncode != 0:
-            report["failures"].append(f"the rehearsal runner failed (exit {proc.returncode}): {proc.stderr.strip()[-500:]}")
+        if code != 0:
+            report["failures"].append(f"the rehearsal runner failed (exit {code}): {stderr[-500:]}")
             return finish()
-        out = json.loads(proc.stdout)
+        out = json.loads(stdout)
 
         probe = out.get("probe") or {}
         report["isolation"]["probe"] = probe

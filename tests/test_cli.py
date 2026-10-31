@@ -23,15 +23,14 @@ from typing import Any
 
 import httpx
 import pytest
-
-from ferry.cli import build_parser
-from ferry.config import load_settings
-from ferry.doctor import PROXY_VARIABLES
-
 from helpers_app import CSP, bundle_setup
 from helpers_bundle import PICKLE_PROTO4, make_workspace
 from helpers_gateway import write_token
 from helpers_upstream import FakeUpstream
+
+from ferry.cli import build_parser
+from ferry.config import load_settings
+from ferry.doctor import PROXY_VARIABLES
 
 PY = sys.executable
 FERRY_SCRIPT = Path(sys.executable).parent / "ferry"
@@ -58,7 +57,8 @@ def _env(extra: dict[str, str] | None = None) -> dict[str, str]:
 def ferry(*args: Any, input: str | None = None, env: dict[str, str] | None = None, cwd: Path | None = None,
           timeout: float = 120) -> subprocess.CompletedProcess[str]:
     return subprocess.run([PY, "-m", "ferry.cli", *map(str, args)], input=input, capture_output=True, text=True,
-                          env=_env(env), cwd=cwd, timeout=timeout, stdin=None if input is not None else subprocess.DEVNULL)
+                          env=_env(env), cwd=cwd, timeout=timeout, stdin=None if input is not None else subprocess.DEVNULL,
+                          check=False)
 
 
 def ok(proc: subprocess.CompletedProcess[str]) -> subprocess.CompletedProcess[str]:
@@ -93,12 +93,12 @@ def _tamper(bundle: Path, target: Path) -> Path:
 def test_the_console_script_entry_point_works() -> None:
     assert FERRY_SCRIPT.is_file(), "pyproject's [project.scripts] ferry = ferry.cli:main is not installed"
     help_text = subprocess.run([str(FERRY_SCRIPT), "--help"], capture_output=True, text=True, env=_env(),
-                               timeout=60, stdin=subprocess.DEVNULL)
+                               timeout=60, stdin=subprocess.DEVNULL, check=False)
     assert help_text.returncode == 0, help_text.stderr
     for name in SPEC_COMMANDS:
         assert re.search(rf"^\s+{name}\s", help_text.stdout, re.MULTILINE), name
     version = subprocess.run([str(FERRY_SCRIPT), "version"], capture_output=True, text=True, env=_env(), timeout=60,
-                             stdin=subprocess.DEVNULL)
+                             stdin=subprocess.DEVNULL, check=False)
     assert version.returncode == 0 and version.stdout.strip() == "ferry 0.1.0"
 
 
@@ -474,3 +474,240 @@ def test_preflight_and_rehearse_are_wired_in() -> None:
     assert parser.parse_args(["preflight", "--", "true"]).func is cli_offline.cmd_preflight
     missing = ferry("preflight")
     assert missing.returncode == 2 and "give the launch command after --" in missing.stderr
+
+
+# --- quality pass: serve proxy headers, checkpoint ordering, exit codes, progress, demo, verify overrides -------
+
+
+def _captured_serve_config(monkeypatch: pytest.MonkeyPatch, data: Path) -> Any:
+    """Run `ferry serve` in-process with uvicorn's Server.run stubbed out; return the uvicorn Config it built."""
+    import uvicorn
+
+    from ferry import cli
+
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(uvicorn.Server, "run", lambda self, *a, **k: captured.setdefault("config", self.config))
+    cli.main(["--data-dir", str(data), "serve"])
+    return captured["config"]
+
+
+def _failed_logins_from_loopback(config: Any, count: int) -> list[int]:
+    from helpers_app import CSRF as CSRF_HEADERS
+    from starlette.testclient import TestClient
+
+    config.load()  # what uvicorn does before serving: wraps the app in ProxyHeadersMiddleware when enabled
+    statuses = []
+    with TestClient(config.loaded_app, client=("127.0.0.1", 50000)) as client:
+        for i in range(count):
+            response = client.post("/api/auth/login", json={"username": f"spray{i}", "password": "wrong-password-1"},
+                                   headers={**CSRF_HEADERS, "X-Forwarded-For": f"203.0.113.{i + 1}",
+                                            "X-Forwarded-Proto": "https"})
+            statuses.append(response.status_code)
+    return statuses
+
+
+def _login_client_ips(data: Path) -> set[Any]:
+    return {json.loads(e["details"]).get("client_ip") for e in _events(data) if e["action"] == "auth.login"}
+
+
+def test_serve_ignores_forwarded_headers_unless_a_proxy_is_trusted(tmp_path: Path,
+                                                                   monkeypatch: pytest.MonkeyPatch) -> None:
+    data = tmp_path / "data"
+    ok(ferry("init", "--data-dir", data))
+    config = _captured_serve_config(monkeypatch, data)
+    assert config.proxy_headers is False and config.forwarded_allow_ips == []
+    statuses = _failed_logins_from_loopback(config, 25)
+    assert 429 in statuses, f"a new X-Forwarded-For per request must not dodge the per-address limit: {statuses}"
+    assert _login_client_ips(data) == {"127.0.0.1"}, "the audited client_ip is the TCP peer, not a client header"
+
+    # An explicitly trusted proxy (here: one on the same host) is believed.
+    proxied = tmp_path / "proxied"
+    ok(ferry("init", "--data-dir", proxied))
+    toml = proxied / "ferry.toml"
+    toml.write_text(toml.read_text().replace("trusted_proxies = []", 'trusted_proxies = ["127.0.0.1", "10.0.0.0/8"]'))
+    config = _captured_serve_config(monkeypatch, proxied)
+    assert config.proxy_headers is True and config.forwarded_allow_ips == ["127.0.0.1", "10.0.0.0/8"]
+    _failed_logins_from_loopback(config, 1)
+    assert _login_client_ips(proxied) == {"203.0.113.1"}
+
+    toml.write_text(toml.read_text().replace('["127.0.0.1", "10.0.0.0/8"]', '["proxy.local"]'))
+    refused = code(ferry("--data-dir", proxied, "serve"), 2)
+    assert "trusted_proxies" in refused.stderr and "proxy.local" in refused.stderr
+
+
+def test_a_checkpoint_that_cannot_be_written_is_not_recorded(tmp_path: Path) -> None:
+    from ferry.db import Database
+    from ferry.evidence import build_evidence
+
+    data = tmp_path / "data"
+    ok(ferry("init", "--data-dir", data))
+    readonly = tmp_path / "ro"
+    readonly.mkdir()
+    os.chmod(readonly, 0o500)
+    try:
+        failed = code(ferry("--data-dir", data, "audit", "checkpoint", "--out", readonly / "cp.json"), 2)
+    finally:
+        os.chmod(readonly, 0o700)
+    assert not (readonly / "cp.json").exists() and "ferry: error" in failed.stderr
+    assert not [e for e in _events(data) if e["action"] == "audit.checkpoint"]
+    settings = load_settings(data_dir=data)
+    with Database(settings.db_path).session() as conn:
+        assert build_evidence(settings, conn)["audit"]["last_checkpoint"] is None
+
+    streamed = json.loads(ok(ferry("--data-dir", data, "audit", "checkpoint")).stdout)
+    recorded = [json.loads(e["details"]) for e in _events(data) if e["action"] == "audit.checkpoint"]
+    assert [(d["seq"], d["out"]) for d in recorded] == [(streamed["seq"], "stdout")]
+
+
+def _flip_member_byte(archive: Path, name: str, target: Path) -> Path:
+    import tarfile
+
+    data = bytearray(archive.read_bytes())
+    with tarfile.open(archive) as tf:
+        member = tf.getmember(name)
+    data[member.offset_data + member.size // 2] ^= 0x01
+    target.write_bytes(bytes(data))
+    return target
+
+
+def test_integrity_refusals_exit_1_and_io_errors_exit_2(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    ok(ferry("init", "--data-dir", data))
+    backup = tmp_path / "backup.tar"
+    ok(ferry("--data-dir", data, "backup", "--out", backup))
+    tampered = _flip_member_byte(backup, "ferry.db", tmp_path / "tampered.tar")
+    refused = code(ferry("restore", tampered, "--data-dir", tmp_path / "r2"), 1)
+    assert "ferry.db" in refused.stderr and "does not match the manifest" in refused.stderr
+    assert "does not exist" in code(ferry("restore", tmp_path / "missing.tar", "--data-dir", tmp_path / "r3"), 2).stderr
+    ok(ferry("restore", backup, "--data-dir", tmp_path / "r4"))
+
+    ok(ferry("keygen", "signer", "--out-dir", tmp_path / "keys", "--no-passphrase"))
+    mismatch = code(ferry("trust", "add", tmp_path / "keys" / "signer.pub.pem", "--name", "S", "--role", "publisher",
+                          "--trust-dir", tmp_path / "trust", "--expect-fingerprint", "0" * 16), 1)
+    assert "fingerprint mismatch" in mismatch.stderr
+    short = code(ferry("trust", "add", tmp_path / "keys" / "signer.pub.pem", "--name", "S", "--role", "publisher",
+                       "--trust-dir", tmp_path / "trust", "--expect-fingerprint", "0" * 4), 2)
+    assert "at least" in short.stderr
+
+
+@pytest.fixture
+def standalone_bundle(tmp_path: Path) -> tuple[Path, Path]:
+    from ferry.trust import add_key
+
+    setup = bundle_setup(tmp_path)
+    trust = tmp_path / "other-trust"
+    add_key(trust, setup.workspace.publisher.pem, name="Vendor", roles=["publisher"])
+    return setup.bundle, trust
+
+
+def test_verify_shows_hashing_progress_only_on_a_terminal(standalone_bundle: tuple[Path, Path],
+                                                          capsys: pytest.CaptureFixture[str],
+                                                          monkeypatch: pytest.MonkeyPatch) -> None:
+    from ferry import cli
+
+    bundle, trust = standalone_bundle
+    assert cli.main(["verify", str(bundle), "--trust-dir", str(trust)]) == 0
+    plain = capsys.readouterr()
+    assert plain.err == ""
+
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+    assert cli.main(["verify", str(bundle), "--trust-dir", str(trust)]) == 0
+    tty = capsys.readouterr()
+    assert tty.out == plain.out, "progress never changes stdout"
+    assert re.search(r"\rhashing \d+\.\d / \d+\.\d GiB \(100%\)\n", tty.err), repr(tty.err)
+
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+    assert cli.main(["verify", str(bundle), "--trust-dir", str(trust), "--json"]) == 0
+    assert capsys.readouterr().err == "", "--json output stays machine-readable"
+
+
+def test_progress_meter_throttles_and_ends_its_line() -> None:
+    import io
+
+    from ferry.cli import _ProgressMeter
+
+    stream = io.StringIO()
+    meter = _ProgressMeter("hashing", stream)
+    meter(0, 0)
+    assert stream.getvalue() == "", "nothing to hash, nothing shown"
+    for done in range(0, 2**30, 2**20):
+        meter(done, 2**30)
+    assert stream.getvalue().count("\r") == 1, "at most one update per interval"
+    meter(2**30, 2**30)
+    assert stream.getvalue().endswith("\rhashing 1.0 / 1.0 GiB (100%)\n")
+    meter.close()
+    assert stream.getvalue().count("\n") == 1
+
+
+DEMO = Path(__file__).resolve().parent.parent / "demo" / "run-demo.sh"
+
+
+def test_demo_expect_fail_accepts_only_a_rejection() -> None:
+    func = re.search(r"^expect_fail\(\) \{\n.*?^\}\n", DEMO.read_text(), re.MULTILINE | re.DOTALL)
+    assert func, "expect_fail not found in demo/run-demo.sh"
+
+    def run(inner: str) -> subprocess.CompletedProcess[str]:
+        script = f"set -euo pipefail\n{func.group(0)}expect_fail sh -c '{inner}'\necho after\n"
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30, check=False)
+
+    rejected = run("exit 1")
+    assert rejected.returncode == 0 and "(rejected as expected)" in rejected.stdout and "after" in rejected.stdout
+    for inner, rc in (("exit 2", 2), ("exit 0", 0)):
+        result = run(inner)
+        assert result.returncode != 0 and f"UNEXPECTED: exit {rc}" in result.stdout, inner
+
+
+def test_demo_two_signer_edit_matches_the_default_config(tmp_path: Path) -> None:
+    from ferry.config import default_config_toml
+
+    assert 'required_roles = ["publisher"]' in default_config_toml(tmp_path)
+    edit = re.search(r'"\$PY" - "\$DATA/ferry.toml" <<\'PYEOF\'\n(.*?)^PYEOF$', DEMO.read_text(),
+                     re.MULTILINE | re.DOTALL)
+    assert edit, "the step-8 config edit was not found in demo/run-demo.sh"
+    script = tmp_path / "edit.py"
+    script.write_text(edit.group(1))
+    data = tmp_path / "data"
+    ok(ferry("init", "--data-dir", data))
+    subprocess.run([PY, str(script), str(data / "ferry.toml")], check=True, timeout=60, env=_env())
+    assert load_settings(data_dir=data).imports.required_roles == ("publisher", "reviewer")
+    changed = tmp_path / "changed.toml"
+    changed.write_text(default_config_toml(data).replace('required_roles = ["publisher"]',
+                                                         'required_roles = [ "publisher" ]'))
+    failed = subprocess.run([PY, str(script), str(changed)], capture_output=True, text=True, timeout=60, env=_env(),
+                            check=False)
+    assert failed.returncode != 0 and "could not set required_roles" in failed.stderr
+
+
+def _verification_rows(data: Path) -> int:
+    conn = sqlite3.connect(data / "ferry.db")
+    try:
+        return int(conn.execute("SELECT COUNT(*) FROM verifications").fetchone()[0])
+    finally:
+        conn.close()
+
+
+def test_verify_overrides_on_a_host_are_not_recorded_as_the_host_verdict(
+        standalone_bundle: tuple[Path, Path], tmp_path: Path) -> None:
+    bundle, other = standalone_bundle
+    data = tmp_path / "host"
+    ok(ferry("init", "--data-dir", data))  # the host trusts nobody yet
+
+    accepted = ok(ferry("--data-dir", data, "verify", bundle, "--trust-dir", other))
+    assert accepted.stdout.startswith("ACCEPTED")
+    assert "Not recorded in the verification history: --trust-dir replaced the host's import policy" in accepted.stdout
+    assert _verification_rows(data) == 0, "an overridden verdict must not reach the inbox or the evidence report"
+    events = [e for e in _events(data) if e["action"] == "bundle.verify"]
+    assert len(events) == 1 and events[0]["outcome"] == "accepted"
+    details = json.loads(events[0]["details"])
+    assert details["overrides"] == ["trust_dir"] and details["trust_dir"] == str(other.resolve())
+    assert details["host_verdict"] is False
+
+    roles = json.loads(ok(ferry("--data-dir", data, "verify", bundle, "--trust-dir", other,
+                                "--require-role", "publisher", "--json")).stdout)
+    assert roles["verdict"] == "accepted" and _verification_rows(data) == 0
+    last = json.loads([e for e in _events(data) if e["action"] == "bundle.verify"][-1]["details"])
+    assert last["overrides"] == ["required_roles", "trust_dir"] and last["required_roles"] == ["publisher"]
+
+    host = code(ferry("--data-dir", data, "verify", bundle), 1)
+    assert host.stdout.startswith("REJECTED") and "Recorded in the verification history" in host.stdout
+    assert _verification_rows(data) == 1, "without overrides the host's own verdict is recorded"

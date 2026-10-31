@@ -22,6 +22,7 @@ them, so the CLI starts quickly.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import getpass
 import json
@@ -30,8 +31,10 @@ import platform
 import shlex
 import shutil
 import sys
+import time
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Sequence
+from typing import IO, TYPE_CHECKING, Any
 
 from . import __version__
 from .errors import ConfigError, CryptoError, FerryError, ValidationFailed
@@ -44,6 +47,9 @@ EXIT_OK, EXIT_REJECTED, EXIT_ERROR = 0, 1, 2
 PASSPHRASE_ENV = "FERRY_KEY_PASSPHRASE"
 MAX_INPUT_BYTES = 16 * 1024 * 1024
 MAX_KEY_FILE_BYTES = 64 * 1024
+# FerryError codes that mean "rejected by a check" (exit 1) rather than a usage, I/O or configuration error (exit 2).
+REJECTION_CODES = frozenset({"backup_rejected", "fingerprint_mismatch"})
+PROGRESS_INTERVAL_S = 0.5
 
 
 class UsageError(FerryError):
@@ -60,7 +66,7 @@ def _err(text: str) -> None:
 def _actor() -> str:
     try:
         return getpass.getuser()
-    except Exception:  # no user database entry, e.g. in a minimal container
+    except Exception:  # noqa: BLE001 - no user database entry, e.g. in a minimal container
         return "unknown"
 
 
@@ -68,6 +74,51 @@ def _safe(value: object, limit: int = 256) -> str:
     from .formats import clean_text
 
     return clean_text(str(value), limit)
+
+
+class _ProgressMeter:
+    """Hashing progress on an interactive stderr: one line rewritten in place at most
+    every PROGRESS_INTERVAL_S, so an operator can tell a slow disk from a hung process."""
+
+    def __init__(self, label: str, stream: IO[str]):
+        self.label, self.stream = label, stream
+        self.last, self.shown = float("-inf"), False
+
+    def __call__(self, done: int, total: int) -> None:
+        now = time.monotonic()
+        if total <= 0 or (done < total and now - self.last < PROGRESS_INTERVAL_S):
+            return
+        self.last = now
+        pct = min(100, done * 100 // total)
+        self.stream.write(f"\r{self.label} {done / 2**30:.1f} / {total / 2**30:.1f} GiB ({pct}%)")
+        self.shown = True
+        if done >= total:
+            self.close()  # finished: end the line so later output starts on a fresh one
+        self.stream.flush()
+
+    def close(self) -> None:
+        if self.shown:
+            self.stream.write("\n")
+            self.stream.flush()
+            self.shown = False
+
+
+@contextlib.contextmanager
+def _progress(label: str, args: argparse.Namespace | None = None) -> Iterator[_ProgressMeter | None]:
+    """A progress callback for the library's hashing loops, or None when stderr is not
+    a terminal or --json was given (scripts get unchanged output)."""
+    try:
+        interactive = sys.stderr.isatty()
+    except (AttributeError, ValueError):
+        interactive = False
+    if not interactive or getattr(args, "json", False):
+        yield None
+        return
+    meter = _ProgressMeter(label, sys.stderr)
+    try:
+        yield meter
+    finally:
+        meter.close()
 
 
 def _env_configured() -> bool:
@@ -226,8 +277,9 @@ def cmd_pack(args: argparse.Namespace) -> int:
     from .bundle.pack import pack_bundle
 
     key = _load_key(args.key, args)
-    result = pack_bundle(args.spec, key, Path(args.out or "."), created_at=args.created_at,
-                         allow_unsafe=args.allow_unsafe)
+    with _progress("hashing", args) as progress:
+        result = pack_bundle(args.spec, key, Path(args.out or "."), created_at=args.created_at,
+                             allow_unsafe=args.allow_unsafe, progress=progress)
     for warning in result.warnings:
         _err(f"warning: {warning}")
     if any(w.startswith("UNSAFE") or "UNSAFE:" in w for w in result.warnings):
@@ -252,7 +304,8 @@ def cmd_sign(args: argparse.Namespace) -> int:
     _require_exists(Path(args.bundle))
     key = _load_key(args.key, args)
     try:
-        result = sign_bundle(args.bundle, key)
+        with _progress("hashing", args) as progress:
+            result = sign_bundle(args.bundle, key, progress=progress)
     except ValidationFailed as exc:
         if "report" not in exc.details:
             raise
@@ -375,27 +428,50 @@ def cmd_verify(args: argparse.Namespace) -> int:
     _require_exists(path)
     settings = _settings(args, required=False)
     imports = settings.imports if settings is not None else ImportSettings()
+    overrides: list[str] = []
     if args.require_role:
         bad = [r for r in args.require_role if r not in SIGNER_ROLES]
         if bad:
             raise UsageError(f"unknown role(s) {', '.join(bad)}; roles are: {', '.join(SIGNER_ROLES)}")
         imports = dataclasses.replace(imports, required_roles=tuple(dict.fromkeys(args.require_role)))
+        overrides.append("required_roles")
     if args.trust_dir:
         imports = dataclasses.replace(imports, trust_dir=str(Path(args.trust_dir).resolve()))
-    if settings is not None:
-        settings = dataclasses.replace(settings, imports=imports)
-        result = verify_only(settings, _database(settings), path, actor_type="cli", actor_id=_actor(), full=args.full)
+        overrides.append("trust_dir")
+    if settings is not None and not overrides:
+        with _progress("hashing", args) as progress:
+            result = verify_only(settings, _database(settings), path, actor_type="cli", actor_id=_actor(),
+                                 full=args.full, progress=progress)
         report, recorded = result.report, True
     else:
-        if not args.trust_dir:
+        if settings is not None:
+            _database(settings)
+        elif not args.trust_dir:
             _err("warning: no trust store given (--trust-dir): no signature can be trusted, so the bundle will be "
                  "rejected")
-        trust = load_trust_store(Path(args.trust_dir)) if args.trust_dir else None
-        report, recorded = verify_bundle(path, imports, trust, full=args.full), False
+        trust_dir = Path(imports.trust_dir) if args.trust_dir else (settings.trust_dir if settings else None)
+        trust = load_trust_store(trust_dir) if trust_dir is not None else None
+        with _progress("hashing", args) as progress:
+            report, recorded = verify_bundle(path, imports, trust, full=args.full, progress=progress), False
+        if settings is not None:
+            # Overridden trust or roles are not the host's verdict: no verifications row (inbox, evidence) and
+            # no version history, only an audit event that names the overrides.
+            _record(settings, action="bundle.verify",
+                    resource=f"bundle:{report.bundle_id}" if report.bundle_id else f"source:{path.name}",
+                    outcome=report.verdict,
+                    details={"bundle_id": report.bundle_id, "source_name": path.name, "verdict": report.verdict,
+                             "overrides": overrides, "trust_dir": str(trust_dir) if trust_dir else None,
+                             "required_roles": list(imports.required_roles), "host_verdict": False,
+                             "signers": [s["key_id"] for s in report.valid_signers] if report.accepted else []})
     if args.json:
         _print_json(report.to_dict())
     else:
-        _print_report(report, recorded=recorded)
+        override_flags = " and ".join({"required_roles": "--require-role", "trust_dir": "--trust-dir"}[o]
+                                      for o in overrides)
+        _print_report(report, recorded=None if settings is not None and overrides else recorded)
+        if settings is not None and overrides:
+            print(f"Not recorded in the verification history: {override_flags} replaced the host's import policy "
+                  "(the audit log records the override). Run without them for the host's verdict.")
     return EXIT_OK if report.accepted else EXIT_REJECTED
 
 
@@ -445,8 +521,9 @@ def cmd_import(args: argparse.Namespace) -> int:
     database = _database(settings)
     path = Path(args.bundle)
     _require_exists(path)
-    result = import_bundle(settings, database, path, actor_type="cli", actor_id=_actor(),
-                           allow_downgrade=args.allow_downgrade)
+    with _progress("hashing", args) as progress:
+        result = import_bundle(settings, database, path, actor_type="cli", actor_id=_actor(),
+                               allow_downgrade=args.allow_downgrade, progress=progress)
     if args.json:
         _print_json(result.to_dict())
     else:
@@ -897,7 +974,7 @@ def cmd_audit_export(args: argparse.Namespace) -> int:
             fd, tmp = tempfile.mkstemp(prefix=f".{out.name}.", dir=out.parent)
             try:
                 with os.fdopen(fd, "w", encoding="ascii", newline="\n") as fh:
-                    count = audit.export_jsonl(conn, fh)
+                    written = audit.export(conn, fh)
                     fh.flush()
                     os.fsync(fh.fileno())
                 os.chmod(tmp, 0o600)
@@ -907,14 +984,12 @@ def cmd_audit_export(args: argparse.Namespace) -> int:
                     os.unlink(tmp)
                 raise
         else:
-            count = audit.export_jsonl(conn, sys.stdout)
+            written = audit.export(conn, sys.stdout)
             sys.stdout.flush()
-        head = audit.head(conn)
         audit.append_event(conn, actor_type="cli", actor_id=_actor(), action="audit.export", resource="audit",
-                           outcome="success", details={"events": count, "head_seq": head["seq"],
-                                                       "head_hash": head["hash"], "via": "cli",
+                           outcome="success", details={**written, "via": "cli",
                                                        "out": str(args.out) if args.out else "stdout"})
-    _err(f"exported {count} audit event(s)" + (f" to {args.out}" if args.out else ""))
+    _err(f"exported {written['events']} audit event(s)" + (f" to {args.out}" if args.out else ""))
     return EXIT_OK
 
 
@@ -924,19 +999,23 @@ def cmd_audit_checkpoint(args: argparse.Namespace) -> int:
 
     settings = _require_settings(args)
     key = _load_key(args.sign_key, args) if args.sign_key else None
+    # One session (one connection): the checkpoint is saved before the audit.checkpoint event is appended, so the
+    # evidence report never cites a checkpoint that was not written.
     with _database(settings).session() as conn:
         checkpoint = audit.make_checkpoint(conn, key)
         signature = checkpoint.get("signature") or {}
+        text = json.dumps(checkpoint, indent=2) + "\n"
+        if args.out:
+            atomic_write(Path(args.out), text.encode("ascii"), mode=0o644)
+        else:
+            sys.stdout.write(text)
+            sys.stdout.flush()
         audit.append_event(conn, actor_type="cli", actor_id=_actor(), action="audit.checkpoint", resource="audit",
                            outcome="success", details={"seq": checkpoint["seq"], "hash": checkpoint["hash"],
                                                        "signed": key is not None, "key_id": signature.get("key_id"),
                                                        "out": str(args.out) if args.out else "stdout"})
-    text = json.dumps(checkpoint, indent=2) + "\n"
     if args.out:
-        atomic_write(Path(args.out), text.encode("ascii"), mode=0o644)
         _err(f"checkpoint of event #{checkpoint['seq']} written to {args.out}; keep a copy outside this host")
-    else:
-        sys.stdout.write(text)
     return EXIT_OK
 
 
@@ -944,7 +1023,9 @@ def cmd_store_verify(args: argparse.Namespace) -> int:
     from .bundle.store import verify_store
 
     settings = _require_settings(args)
-    result = verify_store(settings, database=_database(settings), actor_type="cli", actor_id=_actor())
+    database = _database(settings)
+    with _progress("hashing", args) as progress:
+        result = verify_store(settings, database=database, actor_type="cli", actor_id=_actor(), progress=progress)
     if args.json:
         _print_json(result)
     else:
@@ -1012,9 +1093,14 @@ def cmd_serve(args: argparse.Namespace) -> int:
     if not tls and not is_loopback_host(server.host):
         _err(f"warning: listening on {server.host} without TLS; API keys, console sessions, prompts and completions "
              "cross the network unencrypted. Set [server] tls_cert_file and tls_key_file.")
+    # X-Forwarded-For/-Proto are honoured only from the addresses in [server] trusted_proxies (default: none).
+    # uvicorn's own default trusts loopback, which would let any local client choose its client address (the
+    # login throttle key and the audited client_ip) and the request scheme.
+    proxies = list(server.trusted_proxies)
     config = uvicorn.Config(create_app(settings), host=server.host, port=server.port,
                             ssl_certfile=server.tls_cert_file or None, ssl_keyfile=server.tls_key_file or None,
-                            log_level="info", server_header=False, lifespan="on")
+                            log_level="info", server_header=False, lifespan="on",
+                            proxy_headers=bool(proxies), forwarded_allow_ips=proxies)
     instance = uvicorn.Server(config)
     instance.run()
     return EXIT_OK if instance.started else EXIT_ERROR
@@ -1059,6 +1145,8 @@ def cmd_restore(args: argparse.Namespace) -> int:
     path = Path(args.archive)
     _require_exists(path)
     result = restore_backup(path, Path(data_dir), force=args.force, actor_type="cli", actor_id=_actor())
+    for warning in result.get("warnings", []):
+        _err(f"warning: {warning}")
     if args.json:
         _print_json(result)
     else:
@@ -1282,6 +1370,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         return int(args.func(args) or 0)
     except FerryError as exc:
+        if exc.code in REJECTION_CODES:
+            _err(f"ferry: rejected: {exc.message}")
+            return EXIT_REJECTED
         _err(f"ferry: error: {exc.message}")
         return EXIT_ERROR
     except KeyboardInterrupt:

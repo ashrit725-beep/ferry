@@ -28,7 +28,7 @@ from .. import audit
 from ..bundle import importer
 from ..config import Settings
 from ..db import Database
-from ..errors import Conflict, FerryError
+from ..errors import Conflict, FerryError, operator_detail, operator_traceback
 from ..util import rfc3339
 
 log = logging.getLogger("ferry.gateway.jobs")
@@ -174,7 +174,8 @@ class JobRegistry:
         except FerryError as exc:
             error = exc.message
         except Exception as exc:  # reported on the job; the server keeps running
-            log.error("%s job %s failed: %s", job.kind, job.job_id, type(exc).__name__)
+            log.error("%s job %s for %s failed: %s\n%s", job.kind, job.job_id, job.source_name,
+                      operator_detail(exc), operator_traceback(exc))
             error = f"the {job.kind} failed with an internal error ({type(exc).__name__}); see the server log"
         if error is not None and job.kind == "verify":
             # import_bundle audits its own failures; verify_only does not.
@@ -193,4 +194,5 @@ class JobRegistry:
                                    details={"source_name": job.source_name, "job_id": job.job_id,
                                             "error": error[:500]})
         except Exception as exc:
-            log.error("could not audit the failed verify job %s: %s", job.job_id, type(exc).__name__)
+            log.error("could not audit the failed verify job %s for %s: %s", job.job_id, job.source_name,
+                      operator_detail(exc))

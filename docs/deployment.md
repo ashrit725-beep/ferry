@@ -88,8 +88,13 @@ lines for the GPU devices to the runtime unit.
 Prefer terminating TLS in Ferry (`[server] tls_cert_file`, `tls_key_file`).
 If a reverse proxy terminates TLS instead, it must preserve the `Host` header
 and send `X-Forwarded-Proto`, or the console's CSRF `Origin` check and the
-`Secure` cookie logic reject requests. Verify a login through the proxy before
-handing the system over.
+`Secure` cookie logic reject requests. Ferry ignores `X-Forwarded-For` and
+`X-Forwarded-Proto` unless the connection comes from an address listed in
+`[server] trusted_proxies` (empty by default), so list the proxy's own
+address, e.g. `trusted_proxies = ["127.0.0.1"]` for a proxy on the same host.
+The client address is then the right-most `X-Forwarded-For` entry that is not
+a trusted proxy; it is the login throttle key and the `client_ip` in the audit
+log. Verify a login through the proxy before handing the system over.
 
 ## 6. Backups and restore
 

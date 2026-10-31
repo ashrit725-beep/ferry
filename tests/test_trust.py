@@ -269,3 +269,72 @@ def test_hand_written_entry_with_validity_window(tmp_path):
     assert entry.status(NOW) == "expired"
     assert entry.status(dt.datetime(2025, 12, 31, tzinfo=UTC)) == "not_yet_valid"
     assert entry.status(dt.datetime(2026, 3, 1, tzinfo=UTC)) == "active"
+
+
+class _OwnedBy:
+    """An os.stat_result with st_uid replaced."""
+
+    def __init__(self, st, uid):
+        self._st, self.st_uid = st, uid
+
+    def __getattr__(self, name):
+        return getattr(self._st, name)
+
+
+def _fstat_owned_by(monkeypatch, uid, *, kind):
+    real = os.fstat
+
+    def fake(fd):
+        st = real(fd)
+        return _OwnedBy(st, uid) if kind(st.st_mode) else st
+
+    monkeypatch.setattr(os, "fstat", fake)
+
+
+OTHER_UID = 4242  # neither root nor the user running the tests
+
+
+def test_entry_owned_by_another_user_is_ignored(tmp_path, monkeypatch):
+    from helpers_bundle import make_workspace
+
+    from ferry.bundle import verify_bundle
+
+    if os.geteuid() == OTHER_UID:
+        pytest.skip("tests run as the stand-in uid")
+    ws = make_workspace(tmp_path)
+    bundle = ws.pack().bundle_path
+    with monkeypatch.context() as m:
+        _fstat_owned_by(m, OTHER_UID, kind=stat.S_ISREG)
+        store = load_trust_store(ws.trust_dir)
+    assert store.entries == []
+    why = store.ignored[ws.publisher.key_id]
+    assert f"owned by uid {OTHER_UID}" in why and "chown" in why
+    assert any(ws.publisher.key_id in p and "owned by uid" in p for p in store.problems)
+
+    report = verify_bundle(bundle, ws.policy(), store)
+    assert not report.accepted
+    sig = {s["key_id"]: s for s in report.signatures}[ws.publisher.key_id]
+    assert sig["status"] == "untrusted" and "owned by uid" in sig["detail"]
+
+
+def test_directory_owned_by_another_user_trusts_nothing(tmp_path, monkeypatch):
+    if os.geteuid() == OTHER_UID:
+        pytest.skip("tests run as the stand-in uid")
+    trust_dir = tmp_path / "trust"
+    add_key(trust_dir, make_signer("a").pem, name="A", roles=["publisher"])
+    with monkeypatch.context() as m:
+        _fstat_owned_by(m, OTHER_UID, kind=stat.S_ISDIR)
+        store = load_trust_store(trust_dir)
+    assert store.entries == []
+    assert len(store.problems) == 1 and f"owned by uid {OTHER_UID}" in store.problems[0]
+    assert "no keys are trusted" in store.problems[0] and "chown" in store.problems[0]
+
+
+def test_root_owned_entries_and_directory_are_trusted(tmp_path, monkeypatch):
+    trust_dir = tmp_path / "trust"
+    signer = make_signer("a")
+    add_key(trust_dir, signer.pem, name="A", roles=["publisher"])
+    with monkeypatch.context() as m:
+        _fstat_owned_by(m, 0, kind=lambda mode: True)
+        store = load_trust_store(trust_dir)
+    assert store.problems == [] and [e.key_id for e in store.entries] == [signer.key_id]

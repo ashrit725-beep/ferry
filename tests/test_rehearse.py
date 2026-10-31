@@ -137,3 +137,146 @@ def test_real_model_bundle_rehearses(tmp_path):
     report = rehearse(res.bundle_path, trust_dir=tmp_path / "trust", max_tokens=4, ctx_size=1024)
     assert report["verdict"] == "pass", report["failures"]
     assert report["models"][0]["served_file_matches_import"]
+
+
+# --- CLI: ferry rehearse options -----------------------------------------------------------------------------
+
+
+def _capture_rehearse(monkeypatch) -> list[dict]:
+    """Replace the rehearsal itself and return the keyword arguments of each call."""
+    import ferry.rehearse as rehearse_mod
+
+    calls: list[dict] = []
+
+    def fake(bundle, **kwargs):
+        calls.append(kwargs)
+        return {"verdict": "pass", "bundle": Path(bundle).name, "failures": [], "notes": [], "models": [],
+                "verification_errors": []}
+
+    monkeypatch.setattr(rehearse_mod, "rehearse", fake)
+    return calls
+
+
+def test_rehearse_accepts_data_dir_after_the_command_name():
+    from ferry.cli import build_parser
+
+    args = build_parser().parse_args(["rehearse", "b.tar", "--trust-dir", "t", "--data-dir", "d"])
+    assert args.data_dir == "d"
+
+
+def test_rehearse_keeps_a_global_data_dir_given_before_the_command_name():
+    from ferry.cli import build_parser
+
+    args = build_parser().parse_args(["--data-dir", "g", "rehearse", "b.tar", "--trust-dir", "t"])
+    assert args.data_dir == "g"
+
+
+@pytest.mark.parametrize("flag", ["--data-dir", "--config-data-dir"])
+def test_rehearse_data_dir_selects_the_import_policy(monkeypatch, tmp_path, flag):
+    import ferry.config as config_mod
+    from ferry.cli import main
+
+    calls = _capture_rehearse(monkeypatch)
+    seen: list[tuple] = []
+    policy = config_mod.ImportSettings(required_roles=("publisher", "reviewer"))
+
+    def fake_load(config_path=None, data_dir=None):
+        seen.append((config_path, data_dir))
+        return config_mod.Settings(data_dir=Path(data_dir), imports=policy)
+
+    monkeypatch.setattr(config_mod, "load_settings", fake_load)
+    code = main(["rehearse", str(tmp_path / "b.tar"), "--trust-dir", str(tmp_path), flag, str(tmp_path / "d"),
+                 "--json"])
+    assert code == 0
+    assert seen == [(None, str(tmp_path / "d"))]
+    assert calls[0]["import_settings"].required_roles == ("publisher", "reviewer")
+
+
+def test_rehearse_unknown_role_is_a_usage_error_before_any_import(monkeypatch, tmp_path, capsys):
+    from ferry.cli import main
+
+    calls = _capture_rehearse(monkeypatch)
+    code = main(["rehearse", str(tmp_path / "b.tar"), "--trust-dir", str(tmp_path), "--require-role", "publsher"])
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "publsher" in err and "roles are: publisher, reviewer" in err
+    assert calls == []
+
+
+def test_rehearse_repeated_role_is_required_once(monkeypatch, tmp_path):
+    from ferry.cli import main
+
+    calls = _capture_rehearse(monkeypatch)
+    code = main(["rehearse", str(tmp_path / "b.tar"), "--trust-dir", str(tmp_path), "--require-role", "reviewer",
+                 "--require-role", "reviewer", "--json"])
+    assert code == 0
+    assert calls[0]["import_settings"].required_roles == ("reviewer",)
+
+
+# --- the runner's outer timeout ------------------------------------------------------------------------------
+
+# A runtime that never becomes ready and ignores SIGTERM, recording its process group.
+STUCK = r'''
+import os, signal, sys, time
+if "--version" in sys.argv:
+    print("version: 0.0.0 (build 99999, commit testdouble)")
+    sys.exit(0)
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+with open(%(pgid_file)r, "w") as f:
+    f.write(str(os.getpgid(0)))
+while True:
+    time.sleep(1)
+'''
+
+
+def _stuck_runtime(tmp_path: Path) -> tuple[str, Path]:
+    pgid_file = tmp_path / "runtime.pgid"
+    script = tmp_path / "stuck_llama.py"
+    script.write_text(STUCK % {"pgid_file": str(pgid_file)})
+    wrapper = tmp_path / "llama-server-stuck"
+    wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n')
+    wrapper.chmod(0o755)
+    return str(wrapper), pgid_file
+
+
+def _group_gone(pgid: int, within_s: float = 5.0) -> bool:
+    import time
+
+    deadline = time.monotonic() + within_s
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+@pytest.mark.parametrize("runner_obeys_sigterm", [True, False], ids=["runner-stops-runtime", "runner-killed"])
+def test_runner_timeout_leaves_no_runtime_running(ws, bundle, tmp_path, monkeypatch, runner_obeys_sigterm):
+    import ferry.rehearse as rehearse_mod
+
+    binary, pgid_file = _stuck_runtime(tmp_path)
+    # The outer limit fires while the runner is still inside its load timeout (60 s).
+    monkeypatch.setattr(rehearse_mod, "runner_budget_s", lambda n_models, load_timeout_s: 4.0)
+    if runner_obeys_sigterm:
+        monkeypatch.setattr(rehearse_mod, "STOP_GRACE_S", 0.5)
+    else:
+        # The runner's own stop is still waiting when it is killed, so only the parent's sweep of the announced
+        # process group can stop the runtime.
+        monkeypatch.setattr(rehearse_mod, "STOP_GRACE_S", 60.0)
+        monkeypatch.setattr(rehearse_mod, "RUNNER_GRACE_S", 0.5)
+    report = rehearse(bundle, trust_dir=ws.trust_dir, binary=binary, min_build=None, require_isolation=False,
+                      load_timeout_s=60)
+    assert report["verdict"] == "fail"
+    assert any("did not finish within 4 s" in f for f in report["failures"]), report["failures"]
+    pgid = int(pgid_file.read_text())
+    assert _group_gone(pgid), f"runtime process group {pgid} is still running"
+
+
+def test_runner_budget_covers_every_inner_limit():
+    import ferry.rehearse as rehearse_mod
+
+    for n in (1, 2, 5):
+        inner = n * (600 + rehearse_mod.PROPS_TIMEOUT_S + rehearse_mod.REQUEST_TIMEOUT_S + rehearse_mod.STOP_GRACE_S + 5)
+        assert rehearse_mod.runner_budget_s(n, 600) > inner

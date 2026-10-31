@@ -37,6 +37,7 @@ import ipaddress
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import stat
@@ -635,27 +636,31 @@ def render_markdown(report: dict[str, Any]) -> str:
     lines = [
         f"# Offline preflight ({report.get('verdict', 'fail').upper()})",
         "",
-        f"Command: `{' '.join(report.get('command') or [])}`",
+        "Command:",
+        "",
+        *_fenced(shlex.join(str(arg) for arg in report.get("command") or []), "sh"),
         "",
         "| | |",
         "|---|---|",
-        f"| Isolation | {iso.get('mechanism')}: {iso.get('description')} |",
+        f"| Isolation | {_cell(iso.get('mechanism'))}: {_cell(iso.get('description'))} |",
         f"| {egress_label(iso)} | {yes_no.get(iso.get('egress_blocked'))}"
         f" (TCP: {(probe.get('tcp') or {}).get('result', 'n/a')}, DNS: {(probe.get('dns') or {}).get('result', 'n/a')}) |",
         f"| Ready | {ready_text} |",
         f"| Smoke request | {('HTTP ' + str(request.get('status'))) if request else 'n/a'} |",
         f"| Exit code | {'stopped by the preflight after its checks' if process.get('stopped_by_preflight') else process.get('exit_code')} |",
-        f"| Evidence sources | {', '.join(report.get('evidence_sources') or [])} |",
+        f"| Evidence sources | {_cell(', '.join(report.get('evidence_sources') or []))} |",
         f"| Started / finished | {report.get('started_at')} / {report.get('finished_at')} |",
         "",
     ]
     if report.get("network_attempts"):
         lines += ["## Blocked connection attempts", "", "| Process | PID | Destination | Count |", "|---|---|---|---|"]
-        lines += [f"| {a.get('process') or ''} | {a['pid']} | {a['destination']} | {a['count']} |" for a in report["network_attempts"]]
+        lines += [f"| {_cell(a.get('process'))} | {a['pid']} | {_cell(a['destination'])} | {a['count']} |"
+                  for a in report["network_attempts"]]
         lines.append("")
     if report.get("python_network_calls"):
         lines += ["## Network calls from Python code", "", "| Call | Host | Port | Module | Where | Count |", "|---|---|---|---|---|---|"]
-        lines += [f"| {c['event']} | {c['host']} | {c['port']} | {c.get('module') or ''} | {c.get('location') or ''} | {c['count']} |"
+        lines += [f"| {_cell(c['event'])} | {_cell(c['host'])} | {c['port']} | {_cell(c.get('module'))} | {_cell(c.get('location'))}"
+                  f" | {c['count']} |"
                   for c in report["python_network_calls"]]
         lines.append("")
     if report.get("findings"):
@@ -674,6 +679,23 @@ def render_markdown(report: dict[str, Any]) -> str:
             lines += [f"## {title}", ""] + [f"- {item}" for item in report[key]] + [""]
     lines += ["## What this shows", "", _what_this_shows(iso), ""]
     return "\n".join(lines)
+
+
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _fenced(text: str, info: str = "") -> list[str]:
+    """A fenced code block that no backtick run inside `text` can close early."""
+    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return [fence + info, text, fence]
+
+
+def _cell(value: Any) -> str:
+    """A table cell that a pipe, newline or control character in `value` cannot break."""
+    if value is None:
+        return ""
+    return _CONTROL.sub(" ", str(value)).replace("|", "\\|")
 
 
 def egress_label(iso: dict[str, Any]) -> str:

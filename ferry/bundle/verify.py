@@ -297,7 +297,7 @@ class _Run:
             elif m.mode & 0o7000:
                 bad.append(f"member {quote_untrusted(m.name)} has setuid, setgid or sticky bits (mode {m.mode:o})")
         if not reader.listing_complete:
-            bad.append(f"the bundle has more than {limit:,} members (max_artifacts + {EXTRA_MEMBERS})")
+            bad.append(f"the bundle has more than {limit:,} members ([import].max_artifacts + {EXTRA_MEMBERS})")
         self.verdict_for(bad, "archive.members", f"{len(members)} members, all regular files or directories",
                          "the bundle contains members that are not regular files or directories")
 
@@ -322,12 +322,15 @@ class _Run:
         files = [m for m in members if m.type == FILE]
         total = sum(m.size for m in files)
         if reader.size > pol.max_bundle_bytes:
-            limits.append(f"the bundle is {reader.size:,} bytes; the limit is {pol.max_bundle_bytes:,}")
+            limits.append(f"the bundle is {reader.size:,} bytes; the limit is {pol.max_bundle_bytes:,} "
+                          "([import].max_bundle_bytes)")
         elif total > pol.max_bundle_bytes:
-            limits.append(f"the members add up to {total:,} bytes; the limit is {pol.max_bundle_bytes:,}")
+            limits.append(f"the members add up to {total:,} bytes; the limit is {pol.max_bundle_bytes:,} "
+                          "([import].max_bundle_bytes)")
         for m in files:
             if m.size > pol.max_artifact_bytes:
-                limits.append(f"member {quote_untrusted(m.name)} is {m.size:,} bytes; the limit is {pol.max_artifact_bytes:,}")
+                limits.append(f"member {quote_untrusted(m.name)} is {m.size:,} bytes; the limit is "
+                              f"{pol.max_artifact_bytes:,} ([import].max_artifact_bytes)")
         self.verdict_for(limits, "archive.limits", f"{total:,} bytes in {len(files)} files, within limits",
                          "the bundle exceeds size limits")
 
@@ -341,7 +344,8 @@ class _Run:
             return
         if manifest.size > pol.max_manifest_bytes:
             self.set("manifest.present", "fail",
-                     f"manifest.json is {manifest.size:,} bytes; the limit is {pol.max_manifest_bytes:,}")
+                     f"manifest.json is {manifest.size:,} bytes; the limit is {pol.max_manifest_bytes:,} "
+                     "([import].max_manifest_bytes)")
             return
         try:
             with reader.open(manifest) as fh:
@@ -496,8 +500,15 @@ class _Run:
 
         self.total = sum(a.size for a, _, _ in to_read)
         self._report_progress()
+        # A sink may refuse up front (the importer checks free space for the staged copies).
+        reserve = getattr(self.sink, "reserve", None)
+        if reserve is not None and to_read and not self._rejected(digest_problems, format_problems):
+            reserve(self.total)
         for a, record, member in to_read:
-            out = self.sink(a.path) if self.sink is not None else None
+            # Once the bundle is certain to be rejected, stop staging: the copies would only
+            # be deleted. Hashing goes on, so the report still covers every artifact.
+            stage = self.sink is not None and not self._rejected(digest_problems, format_problems)
+            out = self.sink(a.path) if stage else None
             try:
                 digest, error = self._hash(reader, member, a.size, out)
                 if error is not None:
@@ -530,6 +541,10 @@ class _Run:
                          "artifact digests do not match the manifest")
         self.verdict_for(format_problems, "artifact.format", "detected formats match the declared formats",
                          "artifact formats are wrong or malformed")
+
+    def _rejected(self, *pending: list[str]) -> bool:
+        """True when a failure already decides the verdict (and this is not a full run)."""
+        return not self.full and (any(pending) or self.failed(CHECK_IDS))
 
     def _report_progress(self) -> None:
         if self.progress is not None:

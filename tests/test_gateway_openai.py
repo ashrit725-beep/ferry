@@ -12,6 +12,7 @@ import datetime as dt
 import json
 import os
 import socket
+import sqlite3
 import time
 import uuid
 from contextlib import ExitStack
@@ -22,7 +23,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from ferry import auth, backends
+from ferry import audit, auth, backends
 from ferry.config import ServerSettings
 from ferry.db import write_tx
 from ferry.gateway import openai_api
@@ -842,3 +843,75 @@ def test_unknown_v1_endpoint_is_an_openai_shaped_404(env: GatewayEnv) -> None:
     assert _error(r)["code"] == "unknown_endpoint"
     assert REQUEST_ID_PATTERN.fullmatch(r.headers["x-request-id"])
     assert env.upstream.requests == []
+
+
+# --- streamed completions and the audit log (GWS-4, SF-4) -----------------------------------------------
+
+
+def _failing_audit(monkeypatch, actions: set[str]) -> None:
+    real = audit.append_event
+
+    def append_event(conn: sqlite3.Connection, **kw: Any) -> dict[str, Any]:
+        if kw["action"] in actions:
+            raise sqlite3.OperationalError("database or disk is full")
+        return real(conn, **kw)
+
+    monkeypatch.setattr(audit, "append_event", append_event)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_completion_withheld_when_audit_unwritable(make_env, monkeypatch, caplog, stream: bool) -> None:
+    """A stream must not get past the fail-closed audit rule that a non-streamed request obeys."""
+    env = make_env(backend_kw={"max_concurrency": 1}, queue_timeout_s=0.5)
+    _failing_audit(monkeypatch, {"gateway.chat.completions", openai_api.STREAM_OPENED_ACTION})
+    with caplog.at_level("ERROR", logger=openai_api.log.name), \
+            env.client.stream("POST", "/v1/chat/completions", json=chat_body(MODEL, stream=stream),
+                              headers=bearer(env.api_key)) as r:
+        assert r.status_code == 500
+        assert r.headers["content-type"].startswith("application/json")
+        raw = r.read()
+    err = _error(httpx.Response(500, content=raw))
+    assert err["type"] == "internal_error"
+    assert "withheld" in err["message"] and "writable" in err["message"]
+    assert b"data:" not in raw and env.upstream.completion_text.encode() not in raw
+    assert "database or disk is full" in caplog.text  # the operator sees why, not only the class name
+    monkeypatch.undo()
+    assert env.events() == [] and env.events(openai_api.STREAM_OPENED_ACTION) == []
+    assert env.chat().status_code == 200  # the concurrency slot was given back
+
+
+def test_stream_records_an_opening_event_before_relaying(env: GatewayEnv) -> None:
+    with env.client.stream("POST", "/v1/chat/completions", json=chat_body(MODEL, stream=True),
+                           headers=bearer(env.api_key)) as r:
+        assert r.status_code == 200
+        list(r.iter_lines())
+    [opened] = env.events(openai_api.STREAM_OPENED_ACTION)
+    [done] = env.events()
+    assert opened["seq"] < done["seq"]
+    assert opened["correlation_id"] == done["correlation_id"] == r.headers["x-request-id"]
+    assert opened["outcome"] == "accepted" and opened["actor_id"] == done["actor_id"]
+    assert opened["details"]["stream"] is True and opened["details"]["model"] == MODEL
+    assert opened["details"]["artifact_digest"] == env.digest
+    assert done["outcome"] == "success"
+    with env.conn() as c:
+        assert audit.verify_chain(c)["ok"] is True
+
+
+def test_non_stream_writes_no_opening_event(env: GatewayEnv) -> None:
+    assert env.chat().status_code == 200
+    assert env.events(openai_api.STREAM_OPENED_ACTION) == []
+    assert len(env.events()) == 1
+
+
+def test_stream_whose_closing_write_fails_still_leaves_a_trace(env: GatewayEnv, monkeypatch, caplog) -> None:
+    _failing_audit(monkeypatch, {"gateway.chat.completions"})
+    with caplog.at_level("ERROR", logger=openai_api.log.name), \
+            env.client.stream("POST", "/v1/chat/completions", json=chat_body(MODEL, stream=True),
+                              headers=bearer(env.api_key)) as r:
+        assert r.status_code == 200
+        list(r.iter_lines())
+    monkeypatch.undo()
+    assert env.events() == []
+    [opened] = env.events(openai_api.STREAM_OPENED_ACTION)
+    assert opened["correlation_id"] == r.headers["x-request-id"]
+    assert "database or disk is full" in caplog.text

@@ -10,8 +10,11 @@ Tar: compressed tars are refused (bundles are plain tar on purpose). A corrupt
 header, a missing end-of-archive marker, or data after the end of the archive
 is an error instead of the silent end of archive `tarfile` reports, so nothing
 can hide behind the last member (a ZIP appended to make a polyglot, say).
-While headers are parsed, single reads are capped, so a hostile PAX or GNU
-long-name header cannot make `tarfile` allocate its declared length.
+While headers are parsed, each extended (PAX or GNU long-name) header is
+capped at 64 KiB and all of them together at 16 MiB, so a hostile header cannot
+make `tarfile` allocate its declared length, and many large headers cannot add
+up to gigabytes held in memory before any size limit or signature is checked.
+PAX records are dropped once a member's fields are read.
 
 Directory: the walk uses directory file descriptors and O_NOFOLLOW, so a
 symlink swapped in during verification is refused rather than followed, and
@@ -30,7 +33,8 @@ from typing import IO, Any
 from ..errors import FerryError
 from ..formats import quote_untrusted
 
-HEADER_READ_CAP = 8 * 1024 * 1024
+HEADER_READ_CAP = 64 * 1024
+HEADER_TOTAL_CAP = 16 * 1024 * 1024
 MAX_TRAILER = 1024 * 1024
 MAX_DIR_DEPTH = 32
 
@@ -91,16 +95,31 @@ class BundleReader:
 
 
 class _CappedFile:
-    """The tar file as `tarfile` sees it while listing: any single read over the cap fails."""
+    """The tar file as `tarfile` sees it while listing.
 
-    def __init__(self, fh: IO[bytes], cap: int):
+    Any single read over the cap fails, and reads longer than one header block
+    (the data of PAX and GNU long-name headers) count against a total cap.
+    """
+
+    def __init__(self, fh: IO[bytes], cap: int, total_cap: int):
         self._fh = fh
         self.cap: int | None = cap
+        self.total_cap = total_cap
+        self.extended = 0
 
     def read(self, n: int = -1) -> bytes:
-        if self.cap is not None and (n is None or n < 0 or n > self.cap):
-            raise BundleReadError(f"corrupt tar: a member header needs a {n:,}-byte read, over the "
-                                  f"{HEADER_READ_CAP // (1024 * 1024)} MiB limit")
+        if self.cap is not None:
+            if n is None or n < 0 or n > self.cap:
+                raise BundleReadError(f"corrupt or hostile tar: a member header needs a {n:,}-byte read, over the "
+                                      f"{self.cap // 1024} KiB per-header limit; bundles written by ferry pack stay "
+                                      "far below it, so rebuild the bundle with ferry pack")
+            if n > tarfile.BLOCKSIZE:
+                self.extended += n
+                if self.extended > self.total_cap:
+                    raise BundleReadError(f"corrupt or hostile tar: the member headers carry more than "
+                                          f"{self.total_cap // (1024 * 1024)} MiB of PAX or long-name header data; "
+                                          "bundles written by ferry pack need a few hundred bytes per member, so "
+                                          "rebuild the bundle with ferry pack")
         return self._fh.read(n)
 
     def seek(self, offset: int, whence: int = 0) -> int:
@@ -156,11 +175,13 @@ class TarBundleReader(BundleReader):
                 raise BundleReadError(f"bundle is {label}-compressed or not a tar file; bundles must be plain, "
                                       "uncompressed tar files")
         self._fh.seek(0)
-        capped = _CappedFile(self._fh, HEADER_READ_CAP)
+        capped = _CappedFile(self._fh, HEADER_READ_CAP, HEADER_TOTAL_CAP)
         try:
             self._tf = tarfile.TarFile(fileobj=capped, mode="r", encoding="utf-8", errors="surrogateescape")  # type: ignore[arg-type]
         except BundleReadError:
             raise
+        except RecursionError:
+            raise BundleReadError("corrupt or hostile tar: too many chained extended headers") from None
         except (tarfile.TarError, EOFError, ValueError, OverflowError) as exc:
             raise BundleReadError(f"not a readable tar archive ({exc})") from None
         self._list(max_members)
@@ -174,6 +195,8 @@ class TarBundleReader(BundleReader):
                 info = self._tf.next()
             except BundleReadError:
                 raise
+            except RecursionError:
+                raise BundleReadError("corrupt or hostile tar: too many chained extended headers") from None
             except (tarfile.TarError, EOFError, ValueError, OverflowError, UnicodeError) as exc:
                 raise BundleReadError(f"corrupt or truncated tar ({exc})") from None
             if info is None:
@@ -184,6 +207,7 @@ class TarBundleReader(BundleReader):
             kind = _tar_type(info)
             if kind == FILE and info.offset_data + info.size > self.size:
                 raise BundleReadError(f"truncated tar: member {quote_untrusted(info.name)} extends past the end of the file")
+            info.pax_headers = {}  # path, size and mtime are already applied; nothing else is kept
             self._infos.append(info)
             self.members.append(Member(len(self.members), info.name, kind, info.size if kind == FILE else 0, info.mode))
 

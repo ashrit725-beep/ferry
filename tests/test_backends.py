@@ -6,9 +6,12 @@ Health checks run against the TEST DOUBLE in tests/helpers_upstream.py.
 from __future__ import annotations
 
 import asyncio
+import datetime as _dt
 import json
 import os
 import socket
+import threading
+import time
 from dataclasses import replace
 from typing import Any, Iterator
 
@@ -20,7 +23,7 @@ from ferry.db import write_tx
 from ferry.errors import ConfigError, Conflict, NotFound, ValidationFailed
 from ferry.gateway.state import build_state, close_state
 
-from helpers_gateway import ACTOR, run_health, set_status, store_artifact, store_path, write_token
+from helpers_gateway import ACTOR, chat_body, gateway_env, run_health, set_status, store_artifact, store_path, write_token
 from helpers_upstream import FAKE_BUILD_INFO, FakeUpstream
 
 
@@ -637,3 +640,126 @@ def test_store_digest_for_path(settings, conn, tmp_path) -> None:
     assert backends.store_digest_for_path(settings, store_path(settings, digest)) == digest
     for bad in (None, "", 5, "relative/path", "/x\x00y", str(settings.store_dir), str(tmp_path)):
         assert backends.store_digest_for_path(settings, bad) is None
+
+
+# --- SF-7: bounded health checks and stale statuses ---------------------------------
+
+
+class TrickleServer:
+    """Accepts connections, sends a 200 header with a large Content-Length, then one
+    body byte every `interval` seconds: each read is quick, the response never ends."""
+
+    def __init__(self, interval: float = 0.2) -> None:
+        self.interval = interval
+        self.stop_event = threading.Event()
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(8)
+        self.sock.settimeout(0.1)
+        self.base_url = f"http://127.0.0.1:{self.sock.getsockname()[1]}"
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+
+    def _serve(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                client, _ = self.sock.accept()
+            except OSError:
+                continue
+            threading.Thread(target=self._trickle, args=(client,), daemon=True).start()
+
+    def _trickle(self, client: socket.socket) -> None:
+        with client:
+            try:
+                client.recv(65536)
+                client.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100000\r\n\r\n")
+                while not self.stop_event.wait(self.interval):
+                    client.sendall(b" ")
+            except OSError:
+                pass
+
+    def close(self) -> None:
+        self.stop_event.set()
+        self.thread.join(5)
+        self.sock.close()
+
+
+def test_a_trickling_backend_cannot_stall_the_health_pass(conn, settings, upstream, monkeypatch) -> None:
+    monkeypatch.setattr(backends, "HEALTH_TIMEOUT_S", 0.5)  # read timeout 0.5 s > 0.2 s between bytes
+    trickle = TrickleServer(interval=0.2)
+    try:
+        good = _backend(conn, settings, upstream)
+        slow = int(backends.create_backend(conn, settings, name="wedged", kind="openai", base_url=trickle.base_url,
+                                           **ACTOR)["id"])
+        old = "2026-01-01T00:00:00.000Z"
+        set_status(conn, good, checked_at=old)
+        set_status(conn, slow, checked_at=old)
+
+        async def run() -> tuple[dict[int, dict[str, Any]], float]:
+            state = build_state(settings)
+            try:
+                started = time.monotonic()
+                results = await asyncio.wait_for(backends.check_all_backends(state), 10)
+                return results, time.monotonic() - started
+            finally:
+                await close_state(state)
+
+        results, elapsed = asyncio.run(run())
+    finally:
+        trickle.close()
+    assert elapsed < 3, f"the pass took {elapsed:.1f} s; the per-check deadline is 1 s"
+    stored_slow = backends.get_backend(conn, slow)
+    assert results[slow]["state"] == "down" and stored_slow["last_status"]["state"] == "down"
+    assert "health check exceeded 1 s" in stored_slow["last_status"]["error"]
+    assert stored_slow["last_checked_at"] > old
+    stored_good = backends.get_backend(conn, good)
+    assert stored_good["last_status"]["state"] == "up" and stored_good["last_checked_at"] > old
+    [event] = [e for e in audit.query_events(conn, action="backend.health") if e["resource"] == "backend:wedged"]
+    assert event["details"]["state"] == "down" and "exceeded" in event["details"]["error"]
+
+
+def test_status_max_age_follows_the_health_interval(settings) -> None:
+    assert backends.status_max_age_s(replace(settings, gateway=GatewaySettings(health_interval_s=30))) == 90
+    assert backends.status_max_age_s(replace(settings, gateway=GatewaySettings(health_interval_s=0))) is None
+
+
+def test_stale_or_undated_statuses_count_as_unchecked() -> None:
+    pin = "a" * 64
+    route = {"enabled": 1, "require_verified": 1, "artifact_digest": pin}
+    fresh = {"state": "up", "checked_at": backends.rfc3339(), "served": [{"digest": pin}]}
+    stale = {**fresh, "checked_at": "2026-01-01T00:00:00.000Z"}
+    undated = {k: v for k, v in fresh.items() if k != "checked_at"}
+    assert backends.route_availability(route, {"enabled": 1, "last_status": fresh}, max_age_s=90).code == "ok"
+    for status in (stale, undated, {**fresh, "checked_at": "yesterday"}, {**fresh, "checked_at": ""}):
+        result = backends.route_availability(route, {"enabled": 1, "last_status": status}, max_age_s=90)
+        assert result.code == "backend_unchecked" and not result.available
+        assert result.provenance["state"] == "unknown"
+        assert "last health-checked" in result.reason and "run a check" in result.reason
+    # Health checks disabled: a status only changes on a manual check, so age is not held against it.
+    assert backends.route_availability(route, {"enabled": 1, "last_status": stale}).code == "ok"
+    assert backends.route_availability({**route, "enabled": 0}, {"enabled": 1, "last_status": stale},
+                                       max_age_s=90).code == "route_disabled"
+
+
+def test_route_views_report_stale_statuses_when_asked(conn, settings, upstream) -> None:
+    bid, route_id, digest = _pinned_route(conn, settings, upstream)
+    upstream.model_path = store_path(settings, digest)
+    run_health(settings, bid)
+    assert backends.get_route(conn, route_id, max_age_s=90)["available"] is True
+    set_status(conn, bid, served=backends.get_backend(conn, bid)["last_status"]["served"],
+               checked_at="2026-01-01T00:00:00.000Z")
+    assert backends.get_route(conn, route_id)["available"] is True  # no age limit: unchanged behaviour
+    [view] = backends.list_routes(conn, max_age_s=90)
+    assert view["available"] is False and "last health-checked" in view["reason"]
+
+
+def test_gateway_refuses_a_route_whose_status_went_stale(data_dir, upstream) -> None:
+    with gateway_env(data_dir, upstream, health_interval_s=10.0) as env:
+        assert env.chat().status_code == 200
+        with env.conn() as c:
+            last = backends.get_backend(c, env.backend_id)["last_status"]
+            set_status(c, env.backend_id, served=last["served"], version=last["version"],
+                       checked_at=backends.rfc3339(backends.utc_now() - _dt.timedelta(seconds=31)))
+        response = env.chat(chat_body())
+        assert response.status_code == 503
+        assert "last health-checked" in response.json()["error"]["message"]

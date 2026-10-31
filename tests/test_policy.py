@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import copy
+import json
+import random
+import time
 from typing import Any
 
 import pytest
+from helpers_app import CSRF, app_env
 
 from ferry import audit, auth, policy
 from ferry.db import write_tx
@@ -382,3 +386,123 @@ def test_explain_denies_disabled_and_unknown_apps(conn) -> None:
 def test_explain_validates_its_input(conn, kwargs) -> None:
     with pytest.raises(ValidationFailed):
         policy.explain(conn, **kwargs)
+
+
+# --- bounded warning analysis (GWS-3) ---------------------------------------------------------
+
+
+_NAME_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789"
+
+
+def _short_app_names(count: int) -> list[str]:
+    singles = list(_NAME_CHARS)
+    pairs = [a + b for a in _NAME_CHARS for b in _NAME_CHARS]
+    return [f"app:{name}" for name in (singles + pairs)[:count]]
+
+
+def _oversized_document(rules: int = 440) -> dict[str, Any]:
+    """The probe shape: deny rules sharing the same 256 exact principals (every other
+    one in reverse order) over distinct models, so no rule covers another and the old
+    pairwise search did principals x principals work for every pair."""
+    names = _short_app_names(policy.MAX_LIST_ITEMS)
+    return doc(*(rule(f"r{i}", "deny", principals=names if i % 2 else names[::-1], models=[f"m{i}"])
+                 for i in range(rules)))
+
+
+def _compact(value: Any) -> bytes:
+    return json.dumps(value, separators=(",", ":")).encode()
+
+
+def test_validate_large_policy_is_bounded() -> None:
+    d = _oversized_document()
+    assert len(_compact({"document": d})) <= 1_048_576  # fits the gateway's default body limit
+    started = time.monotonic()
+    result = policy.validate_policy(d, [], [])
+    elapsed = time.monotonic() - started
+    assert elapsed < 2.0, f"validation took {elapsed:.1f} s"
+    assert result["valid"] is True and result["errors"] == []
+    assert len(result["warnings"]) <= policy.MAX_WARNINGS + 1
+    assert result["warnings"][-1]["rule_id"] is None  # the output was truncated with a note
+    # Without inventory there are no per-entry warnings, so the shadow search itself
+    # runs until its budget is spent; that too must stay bounded.
+    started = time.monotonic()
+    plain = policy.validate_policy(d)
+    elapsed = time.monotonic() - started
+    assert elapsed < 2.0, f"validation without inventory took {elapsed:.1f} s"
+    assert plain["valid"] is True and len(plain["warnings"]) <= policy.MAX_WARNINGS + 1
+
+
+def test_validate_endpoint_is_bounded_for_the_auditor(tmp_path) -> None:
+    body = _compact({"document": _oversized_document()})
+    assert len(body) <= 1_048_576
+    with app_env(tmp_path / "data", login_as="auditor") as env:
+        started = time.monotonic()
+        response = env.client.post("/api/policy/validate", content=body,
+                                   headers={**CSRF, "Content-Type": "application/json"})
+        elapsed = time.monotonic() - started
+    assert response.status_code == 200, response.text
+    assert elapsed < 2.0, f"the request took {elapsed:.1f} s"
+    result = response.json()
+    assert result["valid"] is True and len(result["warnings"]) <= policy.MAX_WARNINGS + 1
+
+
+def test_shadow_budget_exhaustion_is_reported_once(monkeypatch) -> None:
+    monkeypatch.setattr(policy, "MAX_SHADOW_COMPARISONS", 50)
+    names = _short_app_names(20)
+    d = doc(*(rule(f"r{i}", "deny", principals=names, models=[f"m{i}"]) for i in range(10)),
+            rule("chat", principals=names[:1], models=["m0"]))
+    warnings = policy.validate_policy(d)["warnings"]
+    skipped = [w for w in warnings if w["message"].startswith("shadow analysis skipped")]
+    assert len(skipped) == 1 and skipped[0]["rule_id"] is None
+    assert "too large" in skipped[0]["message"] and "app:*" in skipped[0]["message"]
+    # The budget ran out before 'chat' was reached, so its shadowing is not claimed.
+    assert not [w for w in warnings if w["rule_id"] == "chat"]
+
+
+def test_budget_note_survives_truncation(monkeypatch) -> None:
+    monkeypatch.setattr(policy, "MAX_SHADOW_COMPARISONS", 10)
+    rules = [rule(f"r{i}", principals=[f"app:ghost{i}"], models=[f"m{i}"]) for i in range(policy.MAX_WARNINGS)]
+    rules.append(rule("lockdown", "deny", principals=["*"], actions=["*"], models=["*"]))
+    warnings = policy.validate_policy(doc(*rules), known_apps=[], known_models=[])["warnings"]
+    assert len(warnings) == policy.MAX_WARNINGS + 1
+    assert any(w["message"].startswith("shadow analysis skipped") for w in warnings)
+    assert "more warning(s) not shown" in warnings[-1]["message"]
+
+
+def test_ordinary_large_policy_is_fully_analysed() -> None:
+    # 1000 single-entry rules are a large but ordinary policy: the whole shadow
+    # search fits the budget, and a late broad deny still shadows the allows.
+    rules = [rule(f"a{i}", principals=[f"app:x{i}"], models=[f"m{i}"]) for i in range(policy.MAX_RULES - 1)]
+    rules.append(rule("lockdown", "deny", principals=["*"], actions=["*"], models=["*"]))
+    warnings = policy.validate_policy(doc(*rules))["warnings"]
+    assert not any(w["message"].startswith("shadow analysis skipped") for w in warnings)
+    assert "never takes effect: deny rule 'lockdown'" in warnings[0]["message"]
+
+
+def test_shadow_search_stops_once_output_is_truncated() -> None:
+    rules = [rule(f"a{i}", principals=[f"app:x{i}"], models=[f"m{i}"]) for i in range(policy.MAX_WARNINGS + 50)]
+    rules.append(rule("lockdown", "deny", principals=["*"], actions=["*"], models=["*"]))
+    warnings = policy.validate_policy(doc(*rules))["warnings"]
+    assert len(warnings) == policy.MAX_WARNINGS + 1
+    assert warnings[-1]["message"].startswith("at least ") and "more warning(s) not shown" in warnings[-1]["message"]
+
+
+def _pattern_lists(rng: random.Random, kind: str) -> list[str]:
+    if kind == "principal":
+        pool = ["*", "app:*", "app:a", "app:b", "app:c", "app:ab"]
+    else:
+        pool = ["*", "q*", "qw*", "qwen-*", "qwen-a", "qwen-b", "llama-*", "llama-a", "q"]
+    return rng.sample(pool, rng.randint(1, 4))
+
+
+def test_set_based_coverage_matches_pairwise_definition() -> None:
+    """The set-based check must agree with the per-pattern definition of coverage."""
+    rng = random.Random(1234)
+    for _ in range(3000):
+        kind = rng.choice(["principal", "model"])
+        parse = policy._principal_pattern if kind == "principal" else policy._model_pattern
+        mine = [parse(x) for x in _pattern_lists(rng, kind)]
+        theirs = [parse(x) for x in _pattern_lists(rng, kind)]
+        expected = all(any(m.covers(t) for m in mine) for t in theirs)
+        got = policy._PatternSet.of(mine).covers(policy._PatternSet.of(theirs))
+        assert got == expected, (kind, [p.raw for p in mine], [p.raw for p in theirs])

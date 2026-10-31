@@ -9,6 +9,7 @@ change them.
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 import tomllib
@@ -36,6 +37,9 @@ class ServerSettings:
     # plain HTTP on a loopback address.
     cookie_secure: str = "auto"
     cors_origins: tuple[str, ...] = ()
+    # Addresses (or networks) of reverse proxies whose X-Forwarded-For/-Proto headers
+    # are believed. Empty: the headers are ignored and the TCP peer is the client.
+    trusted_proxies: tuple[str, ...] = ()
     max_body_bytes: int = 1_048_576
     session_idle_minutes: int = 30
     session_max_hours: int = 8
@@ -176,6 +180,12 @@ def validate(settings: Settings) -> None:
     for origin in s.cors_origins:
         if origin == "*" or not re.fullmatch(r"https?://[A-Za-z0-9.\-\[\]:]+", origin):
             raise ConfigError(f"[server].cors_origins: {origin!r} must be an explicit http(s)://host[:port] origin")
+    for proxy in s.trusted_proxies:
+        try:
+            ipaddress.ip_network(proxy)  # strict, as uvicorn parses it: 10.0.0.0/8, not 10.0.0.1/8
+        except ValueError:
+            raise ConfigError(f"[server].trusted_proxies: {proxy!r} is not an IP address or network; list the "
+                              'reverse proxy\'s own address, e.g. ["127.0.0.1"]') from None
     if not 1 <= s.session_idle_minutes <= 24 * 60 or not 1 <= s.session_max_hours <= 24 * 7:
         raise ConfigError("[server]: session_idle_minutes must be 1-1440 and session_max_hours 1-168")
     if not 1 <= g.max_concurrency <= 1024:
@@ -267,6 +277,7 @@ port = {DEFAULT_PORT}
 # tls_key_file = "/etc/ferry/tls/key.pem"
 cookie_secure = "auto"      # auto | true | false
 cors_origins = []           # the console is same-origin; leave empty unless you know you need it
+trusted_proxies = []        # reverse proxy addresses whose X-Forwarded-For/-Proto are believed (none by default)
 max_body_bytes = 1048576    # largest request body accepted by the gateway
 
 [gateway]

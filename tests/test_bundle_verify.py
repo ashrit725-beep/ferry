@@ -582,7 +582,7 @@ def test_pax_header_larger_than_the_cap(ws):
     hostile = ws.root / "pax.ferry.tar"
     hostile.write_bytes(info.tobuf(tarfile.USTAR_FORMAT) + b"\x00" * 2048)
     report = run(ws, hostile)
-    assert failed(report) == ["archive.readable"] and "MiB limit" in report.errors[0]
+    assert failed(report) == ["archive.readable"] and "KiB per-header limit" in report.errors[0]
 
 
 @pytest.mark.parametrize("content, expected", [
@@ -817,3 +817,95 @@ def test_half_a_gigabyte_verifies_in_seconds(ws):
     print(f"verified {size / MiB:.0f} MiB in {elapsed:.2f} s")
     assert report.accepted, report.errors
     assert elapsed < 10
+
+
+# --------------------------------------------------------------------------- header metadata bounds (VI-5)
+
+def _commented(name: str, data: bytes, comment_bytes: int):
+    info, body = tar_member(name, data)
+    info.pax_headers = {"comment": "c" * comment_bytes}
+    return info, body
+
+
+def test_oversized_pax_headers_are_refused_while_listing(ws):
+    files = base_files()
+    entries = [artifact_entry(p, d, **kw) for p, d, kw in files]
+    raw = manifest_bytes(entries)
+    members = [_commented("manifest.json", raw, MiB)]
+    members += [_commented(f"signatures/{ws.publisher.key_id}.sig", ws.publisher.sign(raw), MiB)]
+    members += [_commented(p, d, MiB) for p, d, _ in files[:1]]
+    hostile = write_tar(ws.root / "comments.ferry.tar", members)
+    report = run(ws, hostile)
+    assert failed(report) == ["archive.readable"]
+    assert "64 KiB per-header limit" in report.errors[0] and "ferry pack" in report.errors[0]
+
+
+def test_many_pax_headers_under_the_per_header_cap_are_refused_in_total(ws):
+    members = [_commented(f"artifacts/docs/n{i:04d}", b"x", 60 * 1024) for i in range(300)]
+    hostile = write_tar(ws.root / "many-comments.ferry.tar", members)
+    report = run(ws, hostile, ws.policy(max_artifacts=1000))
+    assert failed(report) == ["archive.readable"]
+    assert "more than 16 MiB of PAX or long-name header data" in report.errors[0]
+
+
+def test_pax_records_are_not_kept_after_listing(ws):
+    from ferry.bundle.reader import TarBundleReader
+
+    hostile = write_tar(ws.root / "small-comment.ferry.tar", [_commented("manifest.json", b"{}", 32 * 1024)])
+    with TarBundleReader(hostile, max_members=10) as reader:
+        assert [m.name for m in reader.members] == ["manifest.json"]
+        assert all(not info.pax_headers for info in reader._infos)
+
+
+def test_long_paths_still_read(ws, tmp_path):
+    from ferry.bundle.reader import TarBundleReader
+
+    long_name = "models/" + "a" * 230 + ".gguf"
+    arts = ws.default_artifacts()
+    arts[0] = {**arts[0], "path": long_name}
+    report = run(ws, ws.pack(arts).bundle_path)
+    assert report.accepted, report.errors
+    unicode_name = "artifacts/docs/" + "\u00e9\u4e2d" * 100
+    tar = write_tar(tmp_path / "unicode.tar", [tar_member(unicode_name, b"hello")])
+    with TarBundleReader(tar, max_members=10) as reader:
+        assert [m.name for m in reader.members] == [unicode_name]
+        with reader.open(reader.members[0]) as fh:
+            assert fh.read() == b"hello"
+
+
+def test_chained_extended_headers_are_refused_cleanly(ws):
+    block = tarfile.TarInfo("././@PaxHeader")
+    block.type = tarfile.XGLTYPE
+    record = b"20 comment=xxxxxxxx\n"
+    block.size = len(record)
+    one = block.tobuf(tarfile.USTAR_FORMAT) + record + b"\x00" * (512 - len(record))
+    hostile = ws.root / "chain.ferry.tar"
+    hostile.write_bytes(one * 5000 + b"\x00" * 1024)
+    report = run(ws, hostile)
+    assert failed(report) == ["archive.readable"]
+
+
+# --------------------------------------------------------------------------- limit messages name the setting (VI-11)
+
+def test_limit_messages_name_the_setting(ws):
+    source = craft(ws)
+    report = run(ws, source, ws.policy(max_artifact_bytes=10))
+    assert any("[import].max_artifact_bytes" in e for e in report.errors), report.errors
+    report = run(ws, source, ws.policy(max_bundle_bytes=100))
+    assert any("[import].max_bundle_bytes" in e for e in report.errors), report.errors
+    report = run(ws, source, ws.policy(max_manifest_bytes=10))
+    assert any("[import].max_manifest_bytes" in e for e in report.errors), report.errors
+
+
+def test_manifest_schema_bounds_name_the_setting():
+    from ferry.manifest import validate_manifest
+
+    entries = [artifact_entry(p, d, **kw) for p, d, kw in base_files()]
+    doc = json.loads(manifest_bytes(entries))
+    errors = validate_manifest(doc, ImportSettings(max_artifacts=1))
+    assert any("found 2) ([import].max_artifacts)" in e for e in errors), errors
+    errors = validate_manifest(doc, ImportSettings(max_artifact_bytes=10))
+    assert any("must be between 0 and 10 ([import].max_artifact_bytes)" in e for e in errors), errors
+    doc["artifacts"][0]["size"] = -1
+    errors = validate_manifest(doc, ImportSettings())
+    assert not any("[import]" in e for e in errors), errors

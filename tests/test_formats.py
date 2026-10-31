@@ -8,15 +8,19 @@ import io
 import json
 import lzma
 import os
+import pickle
 import struct
+import tarfile
 from pathlib import Path
 
 import pytest
 
 from ferry import formats
+from ferry.bundle import verify_bundle
 from ferry.formats import FormatInfo, detect_format, parse_gguf, parse_safetensors, quote_untrusted, clean_text
 
 from helpers_bundle import (
+    MODEL, crafted_bundle, failed, make_workspace,
     ELF_BYTES, LICENSE_TEXT, PICKLE_PROTO2, PICKLE_PROTO4, SHEBANG_BYTES, T_ARR, T_F32, T_STR, T_U8, T_U32, T_U64,
     TOKENIZER_JSON, GTensor, default_kvs, f32, gguf_bytes, gguf_kv, gguf_str, safetensors_bytes, tar_bytes,
     torch_zip_bytes, zip_bytes,
@@ -231,8 +235,9 @@ def test_gguf_duplicate_tensor_name():
 
 
 def test_gguf_tensor_name_length_limit():
-    assert detect(gguf_bytes(tensors=[GTensor("n" * 64, [4], 0, f32(1, 2, 3, 4))])).ok
-    assert "name is 65 bytes; the limit is 64" in gguf_problem(gguf_bytes(tensors=[GTensor("n" * 65, [4], 0, f32(1, 2, 3, 4))]))
+    # llama.cpp's GGML_MAX_NAME (64) counts the terminating NUL, so 63 bytes is the longest name it loads.
+    assert detect(gguf_bytes(tensors=[GTensor("n" * 63, [4], 0, f32(1, 2, 3, 4))])).ok
+    assert "name is 64 bytes; the limit is 63" in gguf_problem(gguf_bytes(tensors=[GTensor("n" * 64, [4], 0, f32(1, 2, 3, 4))]))
 
 
 def test_gguf_key_longer_than_limit():
@@ -528,3 +533,158 @@ def test_display_helpers_escape_untrusted_text():
     assert quote_untrusted("a\x1b[2Jb‮") == '"a\\u001b[2Jb\\u202e"'
     assert quote_untrusted("x" * 500).endswith("…")
     assert clean_text("ok\x07⁦") == "ok��"
+
+
+# --------------------------------------------------------------------------- quality pass: GGUF strictness, polyglots, archives
+
+
+@pytest.fixture
+def ws(tmp_path):
+    return make_workspace(tmp_path)
+
+
+def _verify_with(ws, extra: tuple[str, bytes, dict]) -> list[str]:
+    files = [("artifacts/docs/LICENSE", LICENSE_TEXT, {"kind": "document", "fmt": "text"}), extra]
+    report = verify_bundle(crafted_bundle(ws.root / "crafted.ferry.tar", [ws.publisher], files),
+                           ws.policy(), ws.trust_store())
+    return failed(report)
+
+
+_POLYGLOT_KEY = b"cos\nsystem\n(S'echo pwned'\ntR."
+
+
+def gguf_pickle_polyglot() -> bytes:
+    """A valid GGUF whose bytes, read by an unpickler from byte 0, run os.system.
+
+    'G' (BINFLOAT) swallows bytes 1-8; tensor count 0x025400 puts 'T' (BINSTRING,
+    length 2) at byte 9; metadata count and the first key's length (0x0643) each
+    start with 'C' (SHORT_BINBYTES, length 6), which lands on the first key's bytes:
+    a protocol-0 GLOBAL. 152,576 one-byte I8 tensors at alignment 1 keep it valid."""
+    n_tensors, n_kv = 0x025400, 0x0643
+    def kv_u8(key: bytes) -> bytes:
+        return struct.pack("<Q", len(key)) + key + struct.pack("<I", 0) + b"\x00"
+    parts = [b"GGUF", struct.pack("<IQQ", 3, n_tensors, n_kv), kv_u8(_POLYGLOT_KEY.ljust(n_kv, b" ")),
+             gguf_kv("general.architecture", T_STR, "llama"), gguf_kv("general.alignment", T_U32, 1)]
+    parts += [kv_u8(b"filler.%04d" % i) for i in range(n_kv - 3)]
+    tail = struct.pack("<IQI", 1, 1, 24)  # one dimension of 1 element, type I8
+    parts += [struct.pack("<Q", 6) + b"%06x" % i + tail + struct.pack("<Q", i) for i in range(n_tensors)]
+    parts.append(b"\x00" * n_tensors)
+    return b"".join(parts)
+
+
+@pytest.fixture(scope="module")
+def polyglot_gguf() -> bytes:
+    return gguf_pickle_polyglot()
+
+
+class _Imported(Exception):
+    pass
+
+
+class _RecordingUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):  # never imports: proves what a loader would import
+        raise _Imported(f"{module}.{name}")
+
+
+def test_gguf_headerless_pickle_polyglot_is_pickle(polyglot_gguf):
+    with pytest.raises(_Imported, match="os.system"):
+        _RecordingUnpickler(io.BytesIO(polyglot_gguf)).load()
+    assert parse_gguf(io.BytesIO(polyglot_gguf), len(polyglot_gguf)).ok  # a valid GGUF on its own
+    info = detect(polyglot_gguf, "model.gguf")
+    assert info.format == "pickle"
+    assert info.metadata["polyglot"] == "gguf" and info.metadata["header"] == "none"
+    normal = detect(gguf_bytes(), "model.gguf")
+    assert normal.format == "gguf" and normal.ok
+
+
+def test_gguf_headerless_pickle_polyglot_in_a_bundle_is_rejected_on_pickle_policy(ws, polyglot_gguf):
+    extra = ("artifacts/models/tiny.gguf", polyglot_gguf, {"kind": "model", "fmt": "gguf", "model": MODEL})
+    assert "policy.pickle" in _verify_with(ws, extra)
+
+
+def _gguf_with_padding(tensors: list[GTensor], pad: int) -> bytes:
+    return gguf_bytes(tensors=tensors) + b"\x00" * pad
+
+
+@pytest.mark.parametrize("data, expected", [
+    (gguf_bytes(tensors=[GTensor("n" * 64, [4], 0, f32(1, 2, 3, 4))]), "name is 64 bytes; the limit is 63"),
+    (_gguf_with_padding([GTensor("t0", [8], 0, f32(*range(8)), offset=0),
+                         GTensor("t1", [8], 0, f32(*range(8)), offset=64)], 96),
+     "tensor \"t1\" is at offset 64, but the tensors declared before it end at 32"),
+    (_gguf_with_padding([GTensor("t0", [8], 0, f32(*range(8)), offset=32),
+                         GTensor("t1", [8], 0, f32(*range(8)), offset=0)], 64),
+     "tensor \"t0\" is at offset 32, but the tensors declared before it end at 0"),
+], ids=["64-byte-name", "gap-between-tensors", "out-of-order"])
+def test_gguf_layouts_llama_cpp_refuses_are_problems(data, expected):
+    info = detect(data, "model.gguf")
+    assert info.format == "gguf" and info.problems
+    assert expected in info.problems[0]
+    assert "re-export the model" in info.problems[0]
+
+
+def test_gguf_contiguous_tensors_have_no_problems():
+    tensors = [GTensor("t0", [8], 0, f32(*range(8))), GTensor("t1", [4], 0, f32(1, 2, 3, 4)),
+               GTensor("q", [64, 2], 2, b"\x01" * (4 * 18))]
+    info = detect(gguf_bytes(tensors=tensors), "ok.gguf")
+    assert info.ok and not info.warnings
+
+
+def _ar_bytes() -> bytes:
+    body = b"#!/bin/sh\necho pwned\n"
+    header = b"run.sh/".ljust(16) + b"0".ljust(12) + b"0".ljust(6) + b"0".ljust(6) + b"100755".ljust(8)
+    return b"!<arch>\n" + header + str(len(body)).encode().ljust(10) + b"`\n" + body
+
+
+def _cpio_newc_bytes() -> bytes:
+    def entry(name: bytes, data: bytes, mode: int) -> bytes:
+        fields = [1, mode, 0, 0, 1, 0, len(data), 0, 0, 0, 0, len(name) + 1, 0]
+        head = b"070701" + b"".join(b"%08X" % f for f in fields) + name + b"\x00"
+        head += b"\x00" * (-len(head) % 4)
+        return head + data + b"\x00" * (-len(data) % 4)
+    return entry(b"run.sh", b"#!/bin/sh\necho pwned\n", 0o100755) + entry(b"TRAILER!!!", b"", 0)
+
+
+def _v7_tar_bytes() -> bytes:
+    # A plain ustar member with its magic and version stripped and the checksum recomputed.
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.USTAR_FORMAT) as tf:
+        info = tarfile.TarInfo("run.sh")
+        payload = b"#!/bin/sh\necho pwned\n"
+        info.size = len(payload)
+        tf.addfile(info, io.BytesIO(payload))
+    raw = bytearray(buf.getvalue())
+    raw[257:265] = b"\x00" * 8
+    raw[148:156] = b" " * 8
+    raw[148:156] = b"%06o\x00 " % sum(raw[:512])
+    return bytes(raw)
+
+
+@pytest.mark.parametrize("data, container", [
+    (_ar_bytes(), "ar"),
+    (_cpio_newc_bytes(), "cpio"),
+    (b"\xc7\x71" + b"\x00" * 40, "cpio"),
+    (_v7_tar_bytes(), "tar"),
+    (b"\x1f\x9d\x90" + b"#!/bin/sh\n", "compress"),
+    (b"LZIP\x01\x0c" + b"run.sh", "lzip"),
+    (b"MSCF\x00\x00\x00\x00" + b"\x00" * 32, "cab"),
+    (b"xar!\x00\x1c\x00\x01" + b"\x00" * 32, "xar"),
+], ids=["ar", "cpio-newc", "cpio-binary", "v7-tar", "compress", "lzip", "cab", "xar"])
+def test_more_archive_containers(data, container):
+    info = detect(data, "notes.txt")
+    assert info.format == "archive" and info.metadata["container"] == container
+
+
+def test_v7_tar_sample_is_a_real_tar():
+    with tarfile.open(fileobj=io.BytesIO(_v7_tar_bytes())) as tf:
+        assert tf.getnames() == ["run.sh"]
+    assert formats._tar_checksum_ok(_v7_tar_bytes())
+    corrupted = bytearray(_v7_tar_bytes())
+    corrupted[0] ^= 1
+    assert not formats._tar_checksum_ok(bytes(corrupted))
+    assert not formats._tar_checksum_ok(b"\x00" * 512)
+    assert detect(b"hello " * 200, "notes.txt").format == "text"
+
+
+def test_ar_archive_declared_as_document_is_rejected_on_archive_policy(ws):
+    extra = ("artifacts/docs/readme.txt", _ar_bytes(), {"kind": "document", "fmt": "archive"})
+    assert _verify_with(ws, extra) == ["policy.archives"]

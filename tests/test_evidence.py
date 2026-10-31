@@ -12,17 +12,24 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from helpers_app import app_env, app_settings, bundle_setup, init_database
+from helpers_bundle import make_signer
+from helpers_gateway import (
+    ACTOR,
+    activate,
+    add_app,
+    add_backend,
+    allow,
+    set_status,
+    store_path,
+)
 
 from ferry import audit, backends
 from ferry.bundle.importer import import_bundle, verify_only
 from ferry.config import Settings
-from ferry.db import Database
+from ferry.db import Database, write_tx
 from ferry.evidence import STATEMENT, build_evidence, render_markdown
 from ferry.trust import add_key
-
-from helpers_app import app_settings, bundle_setup, init_database
-from helpers_bundle import make_signer
-from helpers_gateway import ACTOR, activate, add_app, add_backend, allow, set_status, store_path
 
 SECTIONS = {"report", "statement", "generated_at", "ferry_version", "host", "config", "import_policy", "trust_anchors",
             "trust_problems", "bundles", "verifications", "routes", "active_policy", "policy_history", "audit",
@@ -177,3 +184,135 @@ def test_the_last_checkpoint_is_reported(tmp_path: Path) -> None:
     assert evidence["audit"]["last_checkpoint"]["seq"] == checkpoint["seq"]
     assert evidence["audit"]["last_checkpoint"]["hash"] == checkpoint["hash"]
     assert f"Last recorded checkpoint: event #{checkpoint['seq']}" in render_markdown(evidence)
+
+
+# --- the report builds on the last full verification instead of re-reading the log ---------------
+
+
+def _append(conn, count: int, start: int = 0) -> None:
+    with write_tx(conn):
+        for i in range(start, start + count):
+            audit.append_event(conn, actor_type="app", actor_id="load", action="gateway.request",
+                               resource="model:tiny", outcome="success", details={"n": i, "note": "é \u2603"})
+
+
+def _counting_hash(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    calls = [0]
+    real = audit.compute_hash
+
+    def counting(*args, **kwargs):
+        calls[0] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(audit, "compute_hash", counting)
+    return calls
+
+
+def test_evidence_checks_only_events_after_the_last_full_verification(tmp_path: Path,
+                                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    with app_env(tmp_path / "data") as env:
+        with env.conn() as c:
+            _append(c, 3000)
+        full = env.post("/api/audit/verify").json()
+        assert full["ok"] is True and full["events_checked"] > 3000
+        with env.conn() as c:
+            _append(c, 50, start=3000)
+        calls = _counting_hash(monkeypatch)
+        with env.conn() as c:
+            evidence = build_evidence(env.settings, c)
+        chain = evidence["audit"]
+        # 50 new events plus the audit.verify event itself; not the 3,000 already verified.
+        assert calls[0] <= 51
+        assert chain["ok"] is True and chain["method"] == "incremental" and chain["events_checked"] == 51
+        last = chain["last_full_verification"]
+        assert last["head_seq"] == full["head_seq"] and last["head_hash"] == full["head_hash"]
+        assert last["actor"] == "admin:alice" and last["via"] == "api" and last["ok"] is True
+        assert chain["head_seq"] == full["head_seq"] + 51
+        markdown = render_markdown(evidence)
+        assert "**Intact.** The full verification recorded" in markdown and "admin:alice" in markdown
+        assert f"through #{full['head_seq']} intact" in markdown
+        assert "(since the last full verification)" in markdown
+        assert env.get("/api/evidence").json()["audit"]["method"] == "incremental"
+
+        # An edit before the verified head is the incremental check's blind spot; the
+        # explicit full verification still finds it, and the report then says so
+        # without re-reading the log.
+        with env.conn() as c:
+            c.execute("UPDATE audit_events SET actor_id = 'someone-else' WHERE seq = 10")
+        broken = env.post("/api/audit/verify").json()
+        assert broken["ok"] is False and broken["first_bad_seq"] == 10
+        calls[0] = 0
+        with env.conn() as c:
+            evidence = build_evidence(env.settings, c)
+        assert calls[0] == 0
+        assert evidence["audit"]["ok"] is False and evidence["audit"]["first_bad_seq"] == 10
+        assert evidence["audit"]["method"] == "recorded"
+        markdown = render_markdown(evidence)
+        assert "**BROKEN at event #10:**" in markdown and "run `ferry audit verify` to check again" in markdown
+
+
+def test_evidence_catches_changes_at_and_after_the_verified_head(tmp_path: Path) -> None:
+    with app_env(tmp_path / "data") as env:
+        with env.conn() as c:
+            _append(c, 20)
+        head = env.post("/api/audit/verify").json()["head_seq"]
+        with env.conn() as c:
+            _append(c, 5, start=20)
+            c.execute("UPDATE audit_events SET outcome = 'failure' WHERE seq = ?", (head + 3,))
+            chain = build_evidence(env.settings, c)["audit"]
+            assert chain["ok"] is False and chain["first_bad_seq"] == head + 3 and chain["method"] == "incremental"
+            c.execute("UPDATE audit_events SET outcome = 'success' WHERE seq = ?", (head + 3,))
+            assert build_evidence(env.settings, c)["audit"]["ok"] is True
+            c.execute("UPDATE audit_events SET hash = ? WHERE seq = ?", ("f" * 64, head))
+            chain = build_evidence(env.settings, c)["audit"]
+            assert chain["ok"] is False and chain["first_bad_seq"] == head and "no longer carries" in chain["problem"]
+
+
+def test_verify_chain_from_a_start_point(tmp_path: Path) -> None:
+    settings = app_settings(tmp_path / "data")
+    database = init_database(settings)
+    with database.session() as conn:
+        _append(conn, 10)
+        full = audit.verify_chain(conn)
+        mid = conn.execute("SELECT seq, hash FROM audit_events WHERE seq = 6").fetchone()
+        result = audit.verify_chain(conn, start=(mid["seq"], mid["hash"]))
+        assert result["ok"] is True and result["events_checked"] == full["head_seq"] - 6
+        assert result["head_seq"] == full["head_seq"] and result["head_hash"] == full["head_hash"]
+        assert audit.verify_chain(conn, start=(0, audit.GENESIS_HASH))["events_checked"] == full["events_checked"]
+        assert audit.verify_chain(conn, start=(0, "1" * 64))["ok"] is False
+        assert audit.verify_chain(conn, start=(6, "1" * 64))["first_bad_seq"] == 6
+        with pytest.raises(ValueError):
+            audit.verify_chain(conn, {"seq": 1, "hash": "0" * 64}, start=(6, mid["hash"]))
+        conn.execute("DELETE FROM audit_events WHERE seq = 7")
+        gap = audit.verify_chain(conn, start=(6, mid["hash"]))
+        assert gap["ok"] is False and gap["first_bad_seq"] == 7 and "gap" in gap["problem"]
+        conn.execute("DELETE FROM audit_events WHERE seq >= 6")
+        gone = audit.verify_chain(conn, start=(6, mid["hash"]))
+        assert gone["ok"] is False and gone["first_bad_seq"] == 6 and "missing" in gone["problem"]
+
+
+def test_compute_hash_with_preencoded_details_matches_the_plain_form() -> None:
+    from ferry.util import canonical_json
+    event = {"seq": 7, "event_id": "e" * 32, "ts": "2026-01-01T00:00:00Z", "actor_type": "app", "actor_id": 'a"b\\',
+             "action": "gateway.request", "resource": "model:x", "outcome": "success", "correlation_id": None,
+             "policy_version": 3, "details": {"z": [1, {"y": "\u2603"}], "a": None, "details": "x"},
+             "prev_hash": "0" * 64}
+    assert audit.compute_hash(event, canonical_json(event["details"])) == audit.compute_hash(event)
+    for details in ({}, [], "text", None, {"nested": {"deep": [True, False, 1.5]}}):
+        event["details"] = details
+        assert audit.compute_hash(event, canonical_json(details)) == audit.compute_hash(event)
+
+
+def test_a_failed_verification_without_a_broken_event_falls_back_to_a_full_pass(tmp_path: Path) -> None:
+    settings = app_settings(tmp_path / "data")
+    database = init_database(settings)
+    with database.session() as conn:
+        _append(conn, 5)
+        h = audit.head(conn)
+        audit.append_event(conn, actor_type="cli", actor_id="pytest", action="audit.verify", resource="audit",
+                           outcome="failure", details={"ok": False, "events_checked": h["seq"], "head_seq": h["seq"],
+                                                       "head_hash": h["hash"], "first_bad_seq": None,
+                                                       "problem": "the checkpoint's signature does not verify"})
+        chain = build_evidence(settings, conn)["audit"]
+    assert chain["ok"] is True and chain["method"] == "full" and chain["events_checked"] == h["seq"] + 1
+    assert chain["last_full_verification"]["ok"] is False

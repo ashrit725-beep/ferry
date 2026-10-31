@@ -10,12 +10,17 @@ from __future__ import annotations
 import datetime as _dt
 import http.cookies
 import json
+import logging
+import sqlite3
 from pathlib import Path
 
 import pytest
 
 from ferry.config import ServerSettings
+from ferry.bundle import importer
+from ferry.errors import operator_detail
 from ferry.gateway import admin_api
+from ferry.gateway.jobs import Job, JobRegistry
 from ferry.gateway.app import STATIC_DIR
 from ferry.util import rfc3339, utc_now
 
@@ -258,6 +263,77 @@ def test_unhandled_errors_are_a_generic_500_with_headers(tmp_path: Path, monkeyp
         assert response.headers["x-request-id"] == "trace-me-123"
         assert response.headers["cache-control"] == "no-store"
         assert_security_headers(response)
+
+
+def test_unhandled_errors_log_the_system_text_and_the_stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                            caplog: pytest.LogCaptureFixture) -> None:
+    def disk_full(*args: object, **kwargs: object) -> None:
+        raise sqlite3.OperationalError("database or disk is full")
+
+    monkeypatch.setattr(admin_api, "build_overview", disk_full)
+    with app_env(tmp_path / "data") as env, caplog.at_level(logging.ERROR, logger="ferry.gateway.security"):
+        response = env.get("/api/overview", headers={"X-Request-ID": "disk-full-1"})
+    assert response.status_code == 500 and "disk is full" not in response.text
+    [record] = [r for r in caplog.records if r.name == "ferry.gateway.security"]
+    message = record.getMessage()
+    assert "OperationalError: database or disk is full" in message and "disk-full-1" in message
+    assert ", in disk_full" in message and "Traceback" not in response.text
+
+
+def test_unhandled_error_logs_keep_other_exception_text_out(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                            caplog: pytest.LogCaptureFixture) -> None:
+    secret = "request detail fyk_123456789abc_" + "should-never-leak"
+
+    def explode(*args: object, **kwargs: object) -> None:
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(admin_api, "build_overview", explode)
+    with app_env(tmp_path / "data") as env, caplog.at_level(logging.ERROR, logger="ferry.gateway.security"):
+        assert env.get("/api/overview").status_code == 500
+    [record] = [r for r in caplog.records if r.name == "ferry.gateway.security"]
+    assert "RuntimeError" in record.getMessage() and ", in explode" in record.getMessage()
+    assert secret not in caplog.text
+
+
+def test_operator_detail_names_os_errors_without_the_file_name() -> None:
+    error = PermissionError(13, "Permission denied", "/inbox/secret-name.tar")
+    assert operator_detail(error) == "PermissionError: [Errno 13] Permission denied"
+    assert operator_detail(ValueError("user text")) == "ValueError"
+
+
+def test_a_failed_job_logs_its_source_and_the_system_text(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                          caplog: pytest.LogCaptureFixture) -> None:
+    def locked(*args: object, **kwargs: object) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(importer, "import_bundle", locked)
+    with app_env(tmp_path / "data", users=False) as env:
+        registry = JobRegistry(env.settings, env.database, workers=1)
+        try:
+            job = Job(job_id="job-1", kind="import", source_name="delivery-7.ferry", source_path=tmp_path / "x",
+                      actor_type="user", actor_id="admin", created_at=rfc3339())
+            with caplog.at_level(logging.ERROR, logger="ferry.gateway.jobs"):
+                registry._run(job)
+        finally:
+            registry.shutdown()
+    assert job.state == "failed" and "OperationalError" in (job.error or "")
+    [record] = [r for r in caplog.records if r.name == "ferry.gateway.jobs"]
+    message = record.getMessage()
+    assert "job-1" in message and "delivery-7.ferry" in message and "database is locked" in message
+    assert ", in locked" in message
+
+
+def test_a_failed_import_audit_is_logged(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    class BrokenDatabase:
+        def session(self) -> object:
+            raise sqlite3.OperationalError("attempt to write a readonly database")
+
+    with caplog.at_level(logging.ERROR, logger="ferry.bundle.importer"):
+        importer._audit_failure(BrokenDatabase(), tmp_path / "delivery-8.ferry", "user", "admin",  # type: ignore[arg-type]
+                                RuntimeError("store failed"), step="store")
+    [record] = [r for r in caplog.records if r.name == "ferry.bundle.importer"]
+    message = record.getMessage()
+    assert "delivery-8.ferry" in message and "readonly database" in message and "store" in message
 
 
 def test_validation_errors_never_echo_submitted_values(tmp_path: Path) -> None:

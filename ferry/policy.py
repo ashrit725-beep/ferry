@@ -12,8 +12,9 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable
+from typing import Any
 
 from . import audit
 from .db import write_tx
@@ -31,6 +32,10 @@ MAX_TOKENS_LIMIT = 1_000_000
 # Warnings are advisory; beyond this many the document is wrong in bulk and the
 # response would only amplify a large request.
 MAX_WARNINGS = 200
+# Shadow analysis compares rule pairs; this bounds its work (in pattern
+# comparisons) so an oversized document cannot hold the CPU. Ordinary policies,
+# even 1000 one-principal rules, stay well inside it.
+MAX_SHADOW_COMPARISONS = 5_000_000
 
 RULE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 # The naming grammar shared with auth.py (principals) and backends.py (routes).
@@ -97,10 +102,42 @@ class CompiledRule:
 
     def covers(self, other: CompiledRule) -> bool:
         return (
-            all(any(mine.covers(theirs) for mine in self.principals) for theirs in other.principals)
-            and other.actions <= self.actions
-            and all(any(mine.covers(theirs) for mine in self.models) for theirs in other.models)
+            other.actions <= self.actions
+            and _PatternSet.of(self.models).covers(_PatternSet.of(other.models))
+            and _PatternSet.of(self.principals).covers(_PatternSet.of(other.principals))
         )
+
+
+@dataclass(frozen=True)
+class _PatternSet:
+    """A list of patterns split for set-based coverage checks: an exact-in-exact
+    test is a frozenset subset test and a prefix test is one str.startswith over
+    a tuple, so comparing two 256-entry lists is not 256 x 256 Python calls."""
+
+    exact: frozenset[str]
+    prefixes: tuple[str, ...]
+
+    @classmethod
+    def of(cls, patterns: Iterable[_Pattern]) -> _PatternSet:
+        exact: set[str] = set()
+        prefixes: list[str] = []
+        for p in patterns:
+            if p.prefix is None:
+                exact.add(p.raw)
+            else:
+                prefixes.append(p.prefix)
+        return cls(frozenset(exact), tuple(prefixes))
+
+    def covers(self, other: _PatternSet) -> bool:
+        """True when every value some pattern of `other` matches is matched by one of ours
+        (the same answer as _Pattern.covers applied entry by entry)."""
+        if not self.prefixes:
+            return not other.prefixes and other.exact <= self.exact
+        if not all(p.startswith(self.prefixes) for p in other.prefixes):
+            return False
+        if other.exact <= self.exact:
+            return True
+        return all(raw.startswith(self.prefixes) for raw in other.exact - self.exact)
 
 
 @dataclass(frozen=True)
@@ -295,14 +332,24 @@ def _parse(doc: Any) -> tuple[list[CompiledRule], list[dict[str, str]]]:
 def _warnings(rules: list[CompiledRule], known_apps: Iterable[str] | None,
               known_models: Iterable[str] | None) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
+    uncollected = 0  # warnings past the cap are only counted
 
     def warn(rule_id: str | None, message: str) -> None:
-        out.append({"rule_id": rule_id, "message": message})
+        nonlocal uncollected
+        if len(out) > MAX_WARNINGS:
+            uncollected += 1
+        else:
+            out.append({"rule_id": rule_id, "message": message})
 
     if not rules:
         warn(None, "the policy has no rules, so every request is denied")
     apps = set(known_apps) if known_apps is not None else None
     models = set(known_models) if known_models is not None else None
+    denies = [r for r in rules if r.effect == "deny"]
+    sets = {r.index: (_PatternSet.of(r.principals), _PatternSet.of(r.models)) for r in rules}
+    budget = MAX_SHADOW_COMPARISONS
+    shadow_skipped = False  # the comparison budget ran out
+    shadow_stopped = False  # the output was already truncated, so the count below is a floor
     for rule in rules:
         if apps is not None:
             for p in rule.principals:
@@ -321,20 +368,60 @@ def _warnings(rules: list[CompiledRule], known_apps: Iterable[str] | None,
                 and any(m.prefix == "" for m in rule.models)):
             warn(rule.id, "this rule allows every app to use every model")
         # A deny decides whatever it matches, so an allow covered by any deny never
-        # applies; a deny only becomes decisive if no earlier deny covers it.
-        shadow = next((d for d in rules if d is not rule and d.effect == "deny"
-                       and (rule.effect == "allow" or d.index < rule.index) and d.covers(rule)), None)
+        # applies; a deny only becomes decisive if no earlier deny covers it. The
+        # search is quadratic, so it stops once the output is already truncated or
+        # its comparison budget is spent.
+        if shadow_skipped or shadow_stopped:
+            continue
+        if len(out) > MAX_WARNINGS:
+            shadow_stopped = True
+            continue
+        shadow, spent = _find_shadow(rule, denies, sets, budget)
+        budget -= spent
+        if budget < 0:
+            shadow_skipped = True
+            continue
         if shadow is not None:
             if rule.effect == "allow":
                 warn(rule.id, f"never takes effect: deny rule '{shadow.id}' matches every request this rule allows")
             else:
                 warn(rule.id, f"never decisive: the earlier deny rule '{shadow.id}' already matches "
                               "every request this rule matches")
-    if len(out) > MAX_WARNINGS:
-        dropped = len(out) - MAX_WARNINGS
-        out = out[:MAX_WARNINGS]
-        out.append({"rule_id": None, "message": f"{dropped} more warning(s) not shown"})
+    notes = []
+    if shadow_skipped:
+        notes.append({"rule_id": None, "message": "shadow analysis skipped: the policy is too large to check which "
+                                                  "rules never take effect (errors and the other warnings were "
+                                                  "checked); to check it, write wildcards such as 'app:*' or "
+                                                  "'qwen2.5-*' in place of long principal and model lists"})
+    limit = MAX_WARNINGS - len(notes)
+    if len(out) > limit:
+        dropped = len(out) - limit + uncollected
+        out = out[:limit] + notes
+        floor = "at least " if shadow_stopped else ""
+        out.append({"rule_id": None, "message": f"{floor}{dropped} more warning(s) not shown"})
+    else:
+        out += notes
     return out
+
+
+def _find_shadow(rule: CompiledRule, denies: list[CompiledRule],
+                 sets: dict[int, tuple[_PatternSet, _PatternSet]], budget: int) -> tuple[CompiledRule | None, int]:
+    """The first deny rule that covers `rule` (for a deny, the first earlier one) and the
+    comparisons spent looking. Gives up, returning more than `budget` spent, once the
+    budget is gone."""
+    principals, models = sets[rule.index]
+    cost = 1 + len(principals.exact) + len(principals.prefixes) + len(models.exact) + len(models.prefixes)
+    spent = 0
+    for d in denies:
+        if rule.effect == "deny" and d.index >= rule.index:
+            break  # denies are in index order, so no earlier deny is left
+        spent += cost
+        if spent > budget:
+            return None, spent
+        d_principals, d_models = sets[d.index]
+        if rule.actions <= d.actions and d_models.covers(models) and d_principals.covers(principals):
+            return d, spent
+    return None, spent
 
 
 def validate_policy(doc: Any, known_apps: Iterable[str] | None = None,

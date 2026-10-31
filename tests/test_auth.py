@@ -17,7 +17,7 @@ from ferry.errors import Conflict, NotFound, ValidationFailed
 from ferry.util import sha256_hex
 
 ACTOR = {"actor_type": "cli", "actor_id": "pytest"}
-NOW = dt.datetime(2026, 10, 28, 12, 0, tzinfo=dt.timezone.utc)
+NOW = dt.datetime(2026, 10, 28, 12, 0, tzinfo=dt.UTC)
 PASSWORD = "correct horse battery"
 
 
@@ -402,10 +402,36 @@ def test_last_seen_is_refreshed_sparingly(conn, settings, admin) -> None:
 
 
 def test_purge_expired_sessions(conn, settings, admin) -> None:
-    auth.create_session(conn, admin["id"], settings, now=NOW - dt.timedelta(hours=9))
     live, _ = auth.create_session(conn, admin["id"], settings, now=NOW)
+    auth.create_session(conn, admin["id"], settings, now=NOW - dt.timedelta(hours=9))
     assert auth.purge_expired_sessions(conn, settings, now=NOW + dt.timedelta(minutes=1)) == 1
     assert auth.resolve_session(conn, live, settings, now=NOW + dt.timedelta(minutes=2)) is not None
+
+
+def _session_hashes(conn) -> set[str]:
+    return {r[0] for r in conn.execute("SELECT token_hash FROM sessions")}
+
+
+def test_login_purges_expired_sessions(conn, settings, admin) -> None:
+    # The first browser is closed and never presents its token again.
+    auth.create_session(conn, admin["id"], settings, now=NOW)
+    later = NOW + dt.timedelta(minutes=settings.server.session_idle_minutes, seconds=1)
+    fresh, _ = auth.create_session(conn, admin["id"], settings, now=later)
+    assert _session_hashes(conn) == {sha256_hex(fresh.encode("ascii"))}
+    assert auth.resolve_session(conn, fresh, settings, now=later) is not None
+
+
+def test_login_keeps_live_sessions_and_purges_past_absolute_limit(conn, settings, admin) -> None:
+    other, _ = auth.create_session(conn, admin["id"], settings, now=NOW)
+    second, _ = auth.create_session(conn, admin["id"], settings, now=NOW + dt.timedelta(minutes=1))
+    assert _session_hashes(conn) == {sha256_hex(t.encode("ascii")) for t in (other, second)}
+    # Kept active by use, but past the absolute limit under tightened settings.
+    tight = replace(settings, server=replace(settings.server, session_max_hours=1))
+    for minutes in range(10, 70, 10):
+        auth.resolve_session(conn, other, settings, now=NOW + dt.timedelta(minutes=minutes))
+    third, _ = auth.create_session(conn, admin["id"], tight, now=NOW + dt.timedelta(minutes=61))
+    assert sha256_hex(other.encode("ascii")) not in _session_hashes(conn)
+    assert sha256_hex(third.encode("ascii")) in _session_hashes(conn)
 
 
 # --- login throttle -------------------------------------------------------------------

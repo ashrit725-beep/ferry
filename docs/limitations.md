@@ -29,6 +29,7 @@ risks in [threat-model.md](threat-model.md).
 | Rehearsal fails on the runtime's blocked connection attempts and network-failure lines in its output, but only notes its blocked DNS lookups | A native runtime's lookup of a remote name looks the same as a harmless local one | Name-level DNS evidence, e.g. resolver interposition |
 | Rehearsal only runs GGUF models with llama-server | Safetensors/vLLM stacks need `ferry preflight` with their own launch command | Runtime adapters for vLLM and containers |
 | The sandbox is a test harness, not a containment boundary | Do not preflight untrusted code expecting it to be contained | Use a VM for untrusted code |
+| `ferry preflight`'s outer runner timeout can be shorter than its own inner limits (for example `--ready-timeout 600` with `--request-url`). When the outer timeout fires, only the runner is killed, and the command it started can keep running in the sandbox. `ferry rehearse` was fixed for this on 2026-10-30; preflight was not (finding SF-11) | A timed-out preflight can leave the launched server running | Derive the outer budget from the inner limits, run the runner in its own session, and send SIGTERM and then SIGKILL to its process group, as `ferry rehearse` does now |
 
 ## Bundles
 
@@ -41,6 +42,8 @@ risks in [threat-model.md](threat-model.md).
 | Runtime binaries (llama.cpp, CUDA, wheels) are not carried in bundles; executables are rejected by policy | The operator installs the runtime through their own approved process | Signed runtime bundles with an explicit host opt-in |
 | Rollback protection compares versions per bundle name on one host; it does not detect a rollback across hosts | Each receiving host keeps its own history | Signed, monotonic channel metadata |
 | GGUF validation bounds header counts, lengths, dims, offsets and alignment, but does not compute exact tensor byte sizes per ggml type | A crafted file with in-bounds but wrong sizes reaches the runtime's own parser | Byte-exact accounting per ggml type (v1-additions A3) |
+| Bundle versions must have a numeric core (`MAJOR.MINOR.PATCH`, optional leading `v`, `-pre-release`, `+build`) so rollback protection can order them. `ferry pack` refuses others, such as `latest` or `1.x`; a bundle built another way with such a version fails `policy.rollback` at verify and import, even with `--allow-downgrade` | Free-form version schemes cannot be used; a date works as `2026.10.30` | None planned |
+| When two bundles ship the same bytes, the newest import that declares them as a model sets the shared store record (kind, model name, licence). The evidence report shows each bundle's own signed declaration, but the console bundle detail page and `ferry run <name>` read the shared record, so an older bundle's page shows the newer name and the older name stops resolving (finding VI-6) | An operator can see a licence on an older bundle's page that its signer did not declare | Read the per-bundle declaration from `bundles.manifest` in `/api/bundles/{id}` and the runtime name lookup |
 | Malware scanning is out of scope | Ferry complements the transfer reviewer's scanner, it does not replace it | None planned |
 
 ## Receiving side (optional phase 2)
@@ -53,6 +56,8 @@ risks in [threat-model.md](threat-model.md).
 | Provenance is taken from the last health check (default every 30 s) | A backend restarted on a different file is served until the next check | Re-check on connection errors; shorter interval |
 | Egress guard re-resolves names, but a DNS-rebinding window remains between check and connect | A hostile resolver could redirect a backend name | Use IP-literal backend URLs |
 | Rate limiting is concurrency only; no per-app quotas | One app can use all capacity | Per-app quotas |
+| A streamed completion is withheld unless its `gateway.chat.stream_opened` event commits. If the closing `gateway.chat.completions` write fails after delivery, the request has only the opening event (no usage, no final outcome) and an error log line, and the console traffic figures, which count only `gateway.chat.completions`, leave it out (finding GWS-4) | A database fault in the middle of a stream leaves an incomplete record | Reconcile opening events that have no closing event during audit verification |
+| Policy validation caps the shadowed-rule analysis at 5,000,000 comparisons. When a very large policy (hundreds of rules with long principal and model lists) uses up that budget, the analysis is skipped with one warning; errors and the other warnings are still computed (finding GWS-3) | A rule that never takes effect may go unreported in such a policy | Use wildcards (`app:*`, `qwen2.5-*`) in place of long lists |
 | The audit log is tamper-evident relative to checkpoints kept outside the database, not tamper-proof; no WORM storage | Someone with database write access and no external checkpoint can truncate or rebuild the chain | Export signed checkpoints regularly; WORM storage integration |
 | No encryption at rest for the store or database | Host compromise exposes weights and metadata | Rely on full-disk encryption; envelope encryption later |
 

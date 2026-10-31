@@ -9,12 +9,18 @@ For the evidence of network attempts it reports, per model, the runtime's
 process ids (matched against the macOS sandbox log by `ferry.rehearse`), the
 connects strace saw (Linux, when asked) and network-failure lines in the
 runtime's output.
+
+Each runtime runs in its own session, so the runner announces its process group
+on stderr (PGID_MARKER) as soon as it starts: if the runner itself is killed,
+`ferry.rehearse` can still stop the runtime. On SIGTERM the runner stops the
+runtime it is running before it exits.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -23,11 +29,18 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from .preflight import parse_strace_connects, process_group_members, scan_output, stop_process_group
+from .preflight import (
+    parse_strace_connects,
+    process_group_members,
+    scan_output,
+    stop_process_group,
+)
 from .sandbox import probe_egress, without_proxies
 
 # Proxy environment variables must not redirect loopback traffic.
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+# Line written to stderr with the process group of each runtime started; read by ferry.rehearse.
+PGID_MARKER = "ferry-rehearse-runtime-pgid"
 
 
 def _request(url: str, token: str, body: dict[str, Any] | None = None, timeout: float = 30.0) -> tuple[int, Any]:
@@ -76,6 +89,8 @@ def _run_model(args: dict[str, Any], model: dict[str, Any], token: str) -> dict[
         proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                 env=without_proxies(os.environ), start_new_session=True)
         pids.add(proc.pid)
+        sys.stderr.write(f"{PGID_MARKER} {proc.pid}\n")
+        sys.stderr.flush()
         try:
             deadline = started + float(args.get("load_timeout_s", 120))
             last_track = 0.0
@@ -95,7 +110,7 @@ def _run_model(args: dict[str, Any], model: dict[str, Any], token: str) -> dict[
                     pass
                 time.sleep(0.25)
             out["load_seconds"] = round(time.monotonic() - started, 2)
-            status, props = _request(f"{base}/props", token)
+            status, props = _request(f"{base}/props", token, timeout=float(args.get("props_timeout_s", 30)))
             if status == 200 and isinstance(props, dict):
                 out["build_info"] = props.get("build_info")
                 out["served_model_path"] = props.get("model_path")
@@ -120,7 +135,7 @@ def _run_model(args: dict[str, Any], model: dict[str, Any], token: str) -> dict[
             out["error"] = f"{type(exc).__name__}: {exc}"
         finally:
             pids |= process_group_members(proc.pid)
-            stop_process_group(proc)
+            stop_process_group(proc, grace_s=float(args.get("stop_grace_s", 10)))
             out["exit_code"] = proc.returncode
     out["pids"] = sorted(pids)
     out["output_indicators"], out["hosts_mentioned"] = scan_output(log_path)
@@ -133,7 +148,15 @@ def _run_model(args: dict[str, Any], model: dict[str, Any], token: str) -> dict[
     return out
 
 
+def _terminated(signum: int, _frame: Any) -> None:
+    # SystemExit is not caught by _run_model's `except Exception`, so its `finally` stops the runtime. A second
+    # SIGTERM must not interrupt that cleanup.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    raise SystemExit(128 + signum)
+
+
 def main(argv: list[str] | None = None) -> int:
+    signal.signal(signal.SIGTERM, _terminated)
     args = json.loads((argv or sys.argv[1:])[0])
     token = Path(args["token_file"]).read_text(encoding="utf-8").strip()
     result = {"probe": probe_egress(), "runner_pid": os.getpid(),
