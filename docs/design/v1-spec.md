@@ -67,7 +67,7 @@ management, SSO/LDAP, delta updates, GPU scheduling, prompt logging.
 | `ferry/crypto.py` | Ed25519: `write_keypair`, `load_private_key_file`, `load_public_key_file`, `load_public_key_pem`, `public_key_to_pem`, `key_id`, `short_id`, `sign`, `verify` |
 
 Audit vocabulary (use these action names): `auth.login`, `auth.logout`,
-`gateway.chat.completions`, `gateway.models.list`, `bundle.verify`,
+`gateway.chat.completions`, `gateway.chat.stream_opened`, `gateway.models.list`, `bundle.verify`,
 `bundle.import`, `bundle.sign`, `bundle.pack`, `policy.activate`,
 `principal.create`, `principal.update`, `api_key.create`, `api_key.revoke`,
 `backend.create`, `backend.update`, `backend.delete`, `backend.health`,
@@ -191,9 +191,12 @@ Field rules (enforced by `ferry/manifest.py`, strict: unknown keys rejected):
   Bounded parsing (reject as malformed, never allocate from untrusted counts):
   kv_count <= 65536, tensor_count <= 1,000,000, string len <= 16 MiB, key len <= 65535,
   array count <= 16,000,000, array nesting <= 2, n_dims 1..4, each dim >= 1,
-  element-count product < 2^63, ggml type < 64, tensor names unique and <= 64 bytes,
-  total header bytes parsed <= 256 MiB, every tensor offset < (file size - data start),
-  offsets multiple of `general.alignment` (default 32). Extract: `version`,
+  element-count product < 2^63, ggml type < 64, tensor names unique and <= 63 bytes
+  (llama.cpp's `GGML_MAX_NAME` of 64 counts the terminating NUL), total header bytes
+  parsed <= 256 MiB, every tensor offset < (file size - data start), offsets multiple
+  of `general.alignment` (default 32) and, when every ggml type is known, each offset
+  equal to the padded sum of the sizes of the tensors before it (llama.cpp loads them
+  only there; a gap or an out-of-order layout is malformed). Extract: `version`,
   `architecture` (`general.architecture`), `name` (`general.name`), `file_type`
   (`general.file_type` mapped to llama ftype names, e.g. 15 -> `MOSTLY_Q4_K_M`,
   unknown -> `type_<n>`), `context_length` (`<arch>.context_length`),
@@ -498,7 +501,12 @@ re-hashes every store file and reports mismatches (audit `store.verify`).
   details `{status_code, decision, decisive_rule, model, backend, route_id,
   artifact_digest, provenance, stream, max_tokens_requested, max_tokens_effective,
   prompt_tokens, completion_tokens, latency_ms, error_type}`, `policy_version` set.
-  Never prompt or completion text.
+  Never prompt or completion text. A streamed request also commits
+  `gateway.chat.stream_opened` (outcome `accepted`, `correlation_id` = the request id,
+  details `{model, backend, route_id, artifact_digest, provenance, max_tokens_effective,
+  key_id, environment, stream}`) before the first byte is relayed; if that write fails
+  the stream is withheld with the same 500 a non-stream request gets when its event
+  cannot be written, and `gateway.chat.completions` follows when the stream ends.
 - `ferry/gateway/state.py` defines `GatewayState` (settings, db, http client,
   limiter, policy cache, started_at) stored at `app.state.ferry`.
   `build_state(settings) -> GatewayState`; `PolicyCache.get(conn)` recompiles when
@@ -649,3 +657,13 @@ Markdown/JSON download, network inventory, effective config). Auditor role sees
 read-only UI (admin-only controls hidden and also rejected server-side).
 Restrained, information-dense design for infrastructure and security engineers;
 real data only; clear loading, empty and error states; keyboard accessible.
+
+Rebuilt on 2026-10-30 on Tailwind CSS v4, shadcn components (Base UI
+primitives), motion, Sonner toasts and the cmdk command palette, with Archivo
+Variable and Azeret Mono as bundled font files. Pages, hash routes, API calls,
+actions and the admin/auditor split are unchanged. The design (the enclave's
+pre-flight checklist: a dark scene, amber as the one attention colour, a
+dotted-leader checklist line for every confirmed state, the bundle lifecycle
+across the air gap on Overview) is recorded in `DESIGN.md` and `PRODUCT.md` at
+the repository root. The CSP and offline rules of section 9 still hold, and
+every npm package is pinned and reviewed in `docs/network-dependencies.md`.

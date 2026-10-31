@@ -12,6 +12,8 @@ Status: v0.1.0, a working pre-customer prototype (2026-10-28). Everything below
 runs and is tested on macOS (Apple Silicon). **Linux is implemented but
 untested.** No customer has used it yet. Read [docs/limitations.md](docs/limitations.md).
 
+![The Ferry console on the demo's real data: the bundle lifecycle across the air gap, the enclave readiness checklist and the last 24 hours of gateway traffic](docs/images/console-overview.png)
+
 ## Why
 
 Teams that ship open-weight models into customer-operated disconnected
@@ -34,10 +36,30 @@ The wedge decision and its revision are in [docs/strategy/](docs/strategy/).
 | Receiving side: import, llama-server on the store file, gateway with API keys and policy, provenance check, audit chain, evidence, console | `ferry import/runtime/serve/...` | End-to-end demo with the real model; unauthorized app and unknown model denied before inference |
 | Back up and restore an installation (database snapshot, config, trust, secrets, optional store) with a verified manifest | `ferry backup`, `ferry restore` | Round-trip tests; tampered, incomplete or mislaid members refused; exercised in the demo |
 
-Test suite: 1,310 tests passing on 2026-10-29 (`pytest`), plus 5 opt-in tests
-against real llama.cpp and the real model (`FERRY_TEST_LLAMACPP_MODEL`,
-`FERRY_TEST_REAL_GGUF`). An internal adversarial review found 21 defects, all
-fixed: [docs/security-review.md](docs/security-review.md).
+Test suite (2026-10-30): `pytest tests` collects 1,487 tests. 1,480 passed, 6
+were skipped (5 are opt-in tests against real llama.cpp and the real model, which
+need `FERRY_TEST_LLAMACPP_MODEL`, `FERRY_TEST_REAL_GGUF` or `FERRY_TEST_PERF`)
+and 1 failed: a preflight test that reads kernel sandbox denials back from the
+macOS unified log, which the shell used for that run did not show (it fails the
+same way on the code before these changes). The console adds 24 build checks
+(`pytest web/tests`) and 136 unit tests (`npm test` in `web/`), all passing.
+The full demo below passes end to end on this code. An internal adversarial
+review found 21 defects and a second pass found 44 more; all are fixed or
+recorded: [docs/security-review.md](docs/security-review.md),
+[docs/reviews/quality-pass-2026-10-30.md](docs/reviews/quality-pass-2026-10-30.md).
+
+## The console
+
+The receiving side's console reads like a pre-flight checklist: every fact an
+operator or an auditor needs is a line with a stamped response, and every
+response carries the hash, signer, version or check that proves it. It runs
+inside the disconnected network under a strict Content-Security-Policy, with
+nothing loaded from another origin. Admins act; auditors get the same pages
+read-only.
+
+![Bundle detail: the two-person rule satisfied by a publisher and a reviewer signature, and the 24 checks the verifier ran before anything was copied into the store](docs/images/console-bundle.png)
+
+![Models: the route map from the gateway to the public model name, the backend and the imported file, with provenance and health on every station](docs/images/console-models.png)
 
 ## Quickstart
 
@@ -56,8 +78,11 @@ python3 -m venv .venv
 .venv/bin/python -m pytest -q
 ```
 
-The console is prebuilt in `ferry/static/`. To rebuild it (connected side,
-needs Node): `cd web && npm ci && npm run build`.
+The console (React 19, TypeScript and Vite, with Tailwind CSS v4, shadcn on
+Base UI, motion, Sonner and cmdk) is prebuilt in `ferry/static/`. To rebuild it
+(connected side, needs Node 22.18 or newer): `cd web && npm ci && npm run build`.
+The build fails on any reference to another origin. The design is recorded in
+[DESIGN.md](DESIGN.md) and [PRODUCT.md](PRODUCT.md).
 
 ### Run the full demo
 
@@ -171,6 +196,7 @@ behaviour of Ferry and the runtimes it wraps: [docs/network-dependencies.md](doc
 | [docs/configuration.md](docs/configuration.md) | Every `ferry.toml` setting and environment variable |
 | [docs/deployment.md](docs/deployment.md) | Offline install, systemd units, TLS, backups, upgrades, production readiness status |
 | [docs/design/](docs/design/) | Implementation spec and additions |
+| [PRODUCT.md](PRODUCT.md), [DESIGN.md](DESIGN.md) | Who the console is for, and its design system |
 | [docs/strategy/](docs/strategy/), [docs/research/](docs/research/) | Wedge decision, revision, research memos |
 | [docs/company/](docs/company/) | Customer discovery, target list, pilot, pricing, GTM, metrics, roadmap |
 
